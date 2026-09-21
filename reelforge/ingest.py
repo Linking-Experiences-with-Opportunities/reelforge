@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from .shell import TimeoutError_, ToolError, ffprobe_json, have, require, run
+from .shell import TimeoutError_, ToolError, ffmpeg, ffprobe_json, have, require, run
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
@@ -35,6 +35,10 @@ _PLATFORM_PATTERNS = [
     ("tiktok", re.compile(r"(?:vm|vt)\.tiktok\.com/([A-Za-z0-9]+)"), True),
     ("tiktok", re.compile(r"tiktok\.com/t/([A-Za-z0-9]+)"), True),
 
+    # youtube.com/live/<id> is what a finished live stream's share link looks
+    # like, and it is a different path from /watch and /shorts.
+    ("youtube", re.compile(r"youtube\.com/live/([A-Za-z0-9_-]{6,})"), False),
+    ("youtube", re.compile(r"youtube\.com/embed/([A-Za-z0-9_-]{6,})"), False),
     ("youtube", re.compile(r"(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)([A-Za-z0-9_-]{6,})"), False),
 ]
 
@@ -61,6 +65,52 @@ KEYCHAIN_HINT = (
 )
 
 DEFAULT_DOWNLOAD_TIMEOUT = 180.0
+
+# Analysing an entire multi-hour stream is almost never what you want: a
+# 4-hour source sampled at 2fps is ~30,000 frames to OCR and classify, and the
+# recipe that falls out has hundreds of segments. Past this, ingest refuses
+# unless a section was chosen with --start/--duration.
+LONG_SOURCE_SECONDS = 15 * 60
+
+
+def parse_timecode(value: str) -> float:
+    """Seconds from 'SS', 'MM:SS' or 'HH:MM:SS' (fractional seconds allowed)."""
+    text = str(value).strip()
+    if not text:
+        raise ToolError("empty timecode")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ToolError(f"bad timecode {value!r} (expected SS, MM:SS or HH:MM:SS)")
+    try:
+        numbers = [float(p) for p in parts]
+    except ValueError:
+        raise ToolError(
+            f"bad timecode {value!r} (expected SS, MM:SS or HH:MM:SS)") from None
+    if any(n < 0 for n in numbers):
+        raise ToolError(f"negative timecode {value!r}")
+
+    seconds = 0.0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    return seconds
+
+
+def long_source_message(length: float) -> str:
+    return (
+        f"this source is {format_timecode(length)} long.\n"
+        f"  Analysing it whole would sample tens of thousands of frames and "
+        f"produce a recipe with hundreds of segments.\n"
+        f"  Pick a section instead, e.g.:\n"
+        f"    --start 1:12:30 --duration 45\n"
+        f"  (add --frame-fps 0.5 if you really do want the whole thing)"
+    )
+
+
+def format_timecode(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
 
 
 @dataclass
@@ -124,8 +174,15 @@ def ingest(
     cookies_file: Path | None = None,
     name: str | None = None,
     timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> Source:
-    """Download or copy `source` into a fresh project directory."""
+    """Download or copy `source` into a fresh project directory.
+
+    `start`/`duration` cut a section out of the source. For a URL the cut is
+    pushed down to yt-dlp so only that section is fetched - a four-hour stream
+    does not have to be downloaded whole to use ninety seconds of it.
+    """
     projects_root.mkdir(parents=True, exist_ok=True)
 
     if is_url(source):
@@ -139,6 +196,8 @@ def ingest(
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
             timeout=timeout,
+            start=start,
+            duration=duration,
         )
 
         # A short link only names a redirect code. Now that yt-dlp has resolved
@@ -160,12 +219,51 @@ def ingest(
             f"Expected one of: {', '.join(sorted(VIDEO_SUFFIXES))}"
         )
 
+    # Check the length *before* copying: a multi-hour capture can be tens of
+    # gigabytes, and copying it only to reject it afterwards is a long wait for
+    # an error.
+    if start is None and duration is None:
+        length = float(probe(src_path).get("duration") or 0.0)
+        if length > LONG_SOURCE_SECONDS:
+            raise ToolError(long_source_message(length))
+
     slug = slugify(name or src_path.stem)
     project_dir = _unique_dir(projects_root, slug)
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    if start is not None or duration is not None:
+        # Re-encode the chosen section rather than copying gigabytes.
+        dest = project_dir / "source.mp4"
+        _extract_section(src_path, dest, start, duration)
+        return Source(project_dir, dest, str(src_path), "local",
+                      {"section_start": start, "section_duration": duration})
+
     dest = project_dir / f"source{src_path.suffix.lower()}"
     shutil.copy2(src_path, dest)
     return Source(project_dir, dest, str(src_path), "local", {})
+
+
+def _extract_section(src: Path, dest: Path, start: float | None,
+                     duration: float | None) -> None:
+    """Cut [start, start+duration) out of a local file.
+
+    `-ss` before `-i` seeks by keyframe, which is what makes pulling a minute
+    out of a four-hour capture fast instead of a full decode.
+    """
+    args: list[str] = []
+    if start:
+        args += ["-ss", f"{start:.3f}"]
+    args += ["-i", str(src)]
+    if duration:
+        args += ["-t", f"{duration:.3f}"]
+    args += [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart",
+        str(dest),
+    ]
+    ffmpeg(args)
 
 
 def _rename_project(project_dir: Path, video: Path, projects_root: Path,
@@ -196,6 +294,8 @@ def _download(
     cookies_from_browser: str | None,
     cookies_file: Path | None,
     timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> tuple[Path, dict]:
     require("yt-dlp", "install with: brew install yt-dlp")
 
@@ -213,6 +313,21 @@ def _download(
         cmd += ["--cookies-from-browser", cookies_from_browser]
     if cookies_file:
         cmd += ["--cookies", str(cookies_file)]
+    if start is not None or duration is not None:
+        # Fetch only the requested window. Without this a multi-hour stream is
+        # downloaded in full before a single frame is looked at.
+        begin = start or 0.0
+        end = begin + duration if duration else None
+        span = (f"*{format_timecode(begin)}-{format_timecode(end)}" if end
+                else f"*{format_timecode(begin)}-inf")
+        cmd += ["--download-sections", span, "--force-keyframes-at-cuts"]
+
+        if "youtube.com" in url or "youtu.be" in url:
+            # Sectioned downloads hand the media URL to ffmpeg, and the URLs
+            # minted for the default android/tv clients come back 403 Forbidden
+            # from googlevideo when fetched that way. The web clients issue
+            # URLs ffmpeg can actually read.
+            cmd += ["--extractor-args", "youtube:player_client=web_safari,web"]
     cmd.append(url)
 
     try:

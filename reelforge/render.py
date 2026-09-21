@@ -158,6 +158,49 @@ def _caption_png(segment: dict, recipe: dict, font: str | None, tmp_dir: Path) -
     return out if drawn else None
 
 
+def parse_crop(value: str) -> tuple[str, ...]:
+    """Parse 'x,y,w,h' into ffmpeg crop terms.
+
+    Values are pixels by default, or a percentage of the source when suffixed
+    with '%' - useful for a screen capture whose facecam sits at a fixed
+    fraction of the frame regardless of resolution.
+    """
+    parts = [p.strip() for p in str(value).split(",")]
+    if len(parts) != 4:
+        raise ToolError(
+            f"--crop expects 'x,y,w,h' (got {value!r}). "
+            f"Pixels, or percentages like '2%,69%,7%,29%'."
+        )
+
+    terms = []
+    for part, (dimension, origin) in zip(parts, (("iw", "x"), ("ih", "y"),
+                                                 ("iw", "w"), ("ih", "h"))):
+        if part.endswith("%"):
+            try:
+                fraction = float(part[:-1]) / 100.0
+            except ValueError:
+                raise ToolError(f"--crop: bad percentage {part!r}") from None
+            terms.append(f"{dimension}*{fraction:.6f}")
+        else:
+            try:
+                pixels = float(part)
+            except ValueError:
+                raise ToolError(f"--crop: bad number {part!r}") from None
+            if pixels < 0:
+                raise ToolError(f"--crop: negative value {part!r}")
+            terms.append(f"{pixels:.0f}")
+    x, y, w, h = terms
+    return (w, h, x, y)
+
+
+def _crop_filter(crop: str | None) -> str:
+    if not crop:
+        return ""
+    w, h, x, y = parse_crop(crop)
+    # Keep even dimensions; yuv420p cannot encode odd sizes.
+    return f"crop=w=floor(({w})/2)*2:h=floor(({h})/2)*2:x={x}:y={y},"
+
+
 def _fit_filter(width: int, height: int, fit: str) -> str:
     if fit == "contain":
         return (
@@ -174,7 +217,8 @@ def _fit_filter(width: int, height: int, fit: str) -> str:
 
 
 def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
-                    font: str | None, fit: str, use_clip_audio: bool) -> None:
+                    font: str | None, fit: str, use_clip_audio: bool,
+                    crop: str | None = None) -> None:
     clip = Path(segment_source(segment))
     info = _media_info(clip)
     duration = float(segment["duration"])
@@ -215,9 +259,11 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
         audio_input_index = next_input
         next_input += 1
 
+    crop_chain = _crop_filter(crop)
+
     if fit == "blur":
         chain = (
-            f"[0:v]split=2[bg][fg];"
+            f"[0:v]{crop_chain}split=2[bg][fg];"
             f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},boxblur=luma_radius=40:luma_power=2[bgb];"
             f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fgs];"
@@ -226,7 +272,8 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
         tail = f"[fit]fps={fps},setsar=1"
     else:
         chain = ""
-        tail = f"[0:v]{_fit_filter(width, height, fit)},fps={fps},setsar=1"
+        tail = (f"[0:v]{crop_chain}{_fit_filter(width, height, fit)},"
+                f"fps={fps},setsar=1")
 
     if caption_index is not None:
         # Composite the caption before flattening to yuv420p so the PNG's alpha
@@ -320,6 +367,7 @@ def render(
     music: Path | None = None,
     fit: str = "cover",
     asset_fit: str = "blur",
+    crop: str | None = None,
     font: str | None = None,
     keep_temp: bool = False,
     on_progress=None,
@@ -393,9 +441,15 @@ def render(
             segment_fit = segment.get("fit") or (
                 asset_fit if segment.get("fill") == "asset" else fit
             )
+            # A per-segment crop in the recipe wins over the global --crop,
+            # so one facecam region can differ from another shot's framing.
+            segment_crop = segment.get("crop") or (
+                None if segment.get("fill") == "asset" else crop
+            )
             _render_segment(
                 segment, recipe, part, tmp_root, font_path, segment_fit,
                 use_clip_audio=recipe.get("audio", {}).get("mode") == "source",
+                crop=segment_crop,
             )
             parts.append(part)
 
