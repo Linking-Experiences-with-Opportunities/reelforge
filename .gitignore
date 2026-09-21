@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# reelforge working output
+reelforge-projects/
+projects/
+*.mp4
+*.mov
+*.m4a
+*.mp3
+out-sheet.jpg
+contact-sheet*.jpg
+
+# macOS
+.DS_Store
