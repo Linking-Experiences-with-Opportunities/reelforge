@@ -17,28 +17,119 @@ class TestUrlClassification(unittest.TestCase):
     def test_instagram_reel(self):
         # Share links carry a tracking query string; it must not leak into the
         # post id or the project slug.
-        platform, post = ingest.classify_url(
+        info = ingest.classify_url(
             "https://www.instagram.com/reel/Ab1cD2eF3gH/?stkn=EXAMPLETOKEN=="
         )
-        self.assertEqual(platform, "instagram")
-        self.assertEqual(post, "Ab1cD2eF3gH")
+        self.assertEqual(info.platform, "instagram")
+        self.assertEqual(info.post_id, "Ab1cD2eF3gH")
 
-    def test_instagram_post_and_tiktok_and_youtube(self):
+    def test_instagram_post_and_youtube(self):
         cases = [
             ("https://instagram.com/p/ABC123xyz/", "instagram", "ABC123xyz"),
-            ("https://www.tiktok.com/@someone/video/7412345678901234567",
-             "tiktok", "7412345678901234567"),
             ("https://youtube.com/shorts/dQw4w9WgXcQ", "youtube", "dQw4w9WgXcQ"),
             ("https://youtu.be/dQw4w9WgXcQ", "youtube", "dQw4w9WgXcQ"),
         ]
         for url, platform, post in cases:
             with self.subTest(url=url):
-                self.assertEqual(ingest.classify_url(url), (platform, post))
+                info = ingest.classify_url(url)
+                self.assertEqual((info.platform, info.post_id), (platform, post))
+                self.assertFalse(info.provisional)
 
     def test_unknown_host_falls_back_to_hostname(self):
-        platform, post = ingest.classify_url("https://vimeo.com/123456")
-        self.assertEqual(platform, "vimeo-com")
-        self.assertIsNone(post)
+        info = ingest.classify_url("https://vimeo.com/123456")
+        self.assertEqual(info.platform, "vimeo-com")
+        self.assertIsNone(info.post_id)
+
+
+class TestTikTokUrls(unittest.TestCase):
+    VIDEO_ID = "7412345678901234567"
+
+    def test_canonical_forms_yield_the_real_post_id(self):
+        urls = [
+            f"https://www.tiktok.com/@someone/video/{self.VIDEO_ID}",
+            f"https://www.tiktok.com/@someone/video/{self.VIDEO_ID}"
+            "?is_from_webapp=1&sender_device=pc",
+            f"https://www.tiktok.com/@some.user_1/video/{self.VIDEO_ID}",
+            f"https://m.tiktok.com/v/{self.VIDEO_ID}.html",
+            f"https://www.tiktok.com/embed/{self.VIDEO_ID}",
+            f"https://www.tiktok.com/embed/v2/{self.VIDEO_ID}",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                info = ingest.classify_url(url)
+                self.assertEqual(info.platform, "tiktok")
+                self.assertEqual(info.post_id, self.VIDEO_ID)
+                self.assertFalse(info.provisional)
+
+    def test_photo_carousels_are_recognised(self):
+        info = ingest.classify_url(
+            f"https://www.tiktok.com/@someone/photo/{self.VIDEO_ID}")
+        self.assertEqual((info.platform, info.post_id), ("tiktok", self.VIDEO_ID))
+
+    def test_short_links_are_flagged_provisional(self):
+        urls = [
+            "https://vm.tiktok.com/ZMhKJq8Yx/",
+            "https://vt.tiktok.com/ZSJ8k2mQd/",
+            "https://www.tiktok.com/t/ZTd9aBcDe/",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                info = ingest.classify_url(url)
+                self.assertEqual(info.platform, "tiktok")
+                self.assertTrue(
+                    info.provisional,
+                    "a short-link code is not the post id and must be revisited")
+                self.assertIsNotNone(info.post_id)
+
+    def test_query_string_never_leaks_into_the_id(self):
+        info = ingest.classify_url(
+            f"https://www.tiktok.com/@someone/video/{self.VIDEO_ID}?lang=en&q=1")
+        self.assertEqual(info.post_id, self.VIDEO_ID)
+
+
+class TestProjectRename(unittest.TestCase):
+    def test_short_link_project_is_renamed_to_the_real_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "tiktok-ZMhKJq8Yx"
+            project.mkdir()
+            video = project / "source.mp4"
+            video.write_bytes(b"x")
+
+            new_dir, new_video = ingest._rename_project(
+                project, video, root, "tiktok-7412345678901234567")
+
+            self.assertEqual(new_dir.name, "tiktok-7412345678901234567")
+            self.assertTrue(new_video.exists())
+            self.assertFalse(project.exists())
+
+    def test_rename_is_skipped_when_the_target_is_taken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "tiktok-ZMhKJq8Yx"
+            project.mkdir()
+            video = project / "source.mp4"
+            video.write_bytes(b"x")
+            (root / "tiktok-999").mkdir()
+
+            new_dir, new_video = ingest._rename_project(
+                project, video, root, "tiktok-999")
+
+            self.assertEqual(new_dir, project)
+            self.assertEqual(new_video, video)
+            self.assertTrue(video.exists())
+
+    def test_rename_to_the_same_name_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "tiktok-abc"
+            project.mkdir()
+            video = project / "source.mp4"
+            video.write_bytes(b"x")
+
+            new_dir, new_video = ingest._rename_project(
+                project, video, root, "tiktok-abc")
+            self.assertEqual((new_dir, new_video), (project, video))
 
     def test_is_url(self):
         self.assertTrue(ingest.is_url("https://x.com/a"))
@@ -90,6 +181,26 @@ class TestCaptionSeeding(unittest.TestCase):
 
     def test_blank_text_opt_out(self):
         self.assertEqual(recipe._starting_text("STOP SCROLLING", False, False), "")
+
+    def test_platform_watermarks_are_not_seeded_as_captions(self):
+        # OCR reads TikTok's drifting "TikTok @handle" stamp as on-screen text;
+        # burning another creator's handle into the render would be wrong.
+        for watermark in ("Gorillo TikTok @gorilloyt", "TikTok", "@gorilloyt",
+                          "Instagram", "YouTube"):
+            with self.subTest(watermark=watermark):
+                self.assertTrue(recipe._looks_like_watermark(watermark))
+                self.assertEqual(recipe._starting_text(watermark, False, True), "")
+
+    def test_real_captions_survive_the_watermark_filter(self):
+        for caption in ("how many frogs can you find", "STOP SCROLLING",
+                        "3 things I wish I knew"):
+            with self.subTest(caption=caption):
+                self.assertFalse(recipe._looks_like_watermark(caption))
+                self.assertEqual(recipe._starting_text(caption, False, True), caption)
+
+    def test_a_sentence_mentioning_a_platform_is_not_a_watermark(self):
+        sentence = "I built this on TikTok last year and it changed everything"
+        self.assertFalse(recipe._looks_like_watermark(sentence))
 
 
 class TestOcrCleaning(unittest.TestCase):

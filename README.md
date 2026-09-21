@@ -51,7 +51,23 @@ Check everything at once:
 ```bash
 reelforge ingest ./some-reel.mp4
 reelforge ingest "https://www.instagram.com/reel/XXXXXXXX/" --cookies-from-browser chrome
+reelforge ingest "https://www.tiktok.com/@someone/video/7412345678901234567"
+reelforge ingest "https://vm.tiktok.com/ZMhKJq8Yx/"
 ```
+
+Any URL yt-dlp supports will be attempted. These forms are recognised by name,
+which gives the project a sensible slug and the right cookie guidance:
+
+| platform | forms |
+|---|---|
+| Instagram | `/reel/`, `/reels/`, `/p/`, `/tv/` |
+| TikTok | `@user/video/<id>`, `@user/photo/<id>` (carousels), `m.tiktok.com/v/<id>`, `/embed/<id>`, `/embed/v2/<id>`, and the short links `vm.tiktok.com/<code>`, `vt.tiktok.com/<code>`, `tiktok.com/t/<code>` |
+| YouTube | `/shorts/`, `/watch?v=`, `youtu.be/` |
+
+TikTok short links contain a redirect code rather than the post id, so the
+project is created under that code and then **renamed to the real id** once
+yt-dlp resolves it. Query strings (`?is_from_webapp=1`, `?lang=en`) never leak
+into the id or the project name.
 
 Instagram and TikTok refuse logged-out downloads, so `--cookies-from-browser`
 (`chrome`, `firefox`, `safari`, `edge`, `brave`) reuses the session you already
