@@ -7,6 +7,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from .shell import TimeoutError_, ToolError, ffprobe_json, have, require, run
 
@@ -14,11 +15,27 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 # Platforms we explicitly know how to name. Anything else still goes through
 # yt-dlp; this map only drives the project slug and the cookie hint.
+#
+# The third element marks a *provisional* id: a short-link code that only
+# resolves to the real post id after an HTTP redirect. Those projects are
+# renamed once yt-dlp reports the true id.
 _PLATFORM_PATTERNS = [
-    ("instagram", re.compile(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)")),
-    ("tiktok", re.compile(r"tiktok\.com/.*?/video/(\d+)")),
-    ("tiktok", re.compile(r"vm\.tiktok\.com/([A-Za-z0-9]+)")),
-    ("youtube", re.compile(r"(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)([A-Za-z0-9_-]{6,})")),
+    ("instagram", re.compile(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)"), False),
+
+    # Canonical desktop/mobile post URLs. TikTok serves image carousels under
+    # /photo/ and they download the same way, so both verbs are accepted.
+    ("tiktok", re.compile(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)"), False),
+    ("tiktok", re.compile(r"(?:m\.)?tiktok\.com/v/(\d+)"), False),
+    ("tiktok", re.compile(r"tiktok\.com/embed/v2/(\d+)"), False),
+    ("tiktok", re.compile(r"tiktok\.com/embed/(\d+)"), False),
+    # Anything else carrying a bare 19-digit TikTok id.
+    ("tiktok", re.compile(r"tiktok\.com/.*?/video/(\d+)"), False),
+    # Short links: vm./vt. hosts and the /t/ path. The code is a redirect key,
+    # not the post id.
+    ("tiktok", re.compile(r"(?:vm|vt)\.tiktok\.com/([A-Za-z0-9]+)"), True),
+    ("tiktok", re.compile(r"tiktok\.com/t/([A-Za-z0-9]+)"), True),
+
+    ("youtube", re.compile(r"(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)([A-Za-z0-9_-]{6,})"), False),
 ]
 
 COOKIE_HINT = (
@@ -65,14 +82,24 @@ def is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
-def classify_url(url: str) -> tuple[str, str | None]:
-    """Return (platform, post_id) for a URL, best effort."""
-    for platform, pattern in _PLATFORM_PATTERNS:
+class UrlInfo(NamedTuple):
+    platform: str
+    post_id: str | None
+    # True when post_id is a short-link code that only becomes the real post id
+    # after following a redirect, so the project name should be revisited once
+    # yt-dlp reports the actual id.
+    provisional: bool = False
+
+
+def classify_url(url: str) -> UrlInfo:
+    """Identify the platform and post id behind a URL, best effort."""
+    for platform, pattern, provisional in _PLATFORM_PATTERNS:
         match = pattern.search(url)
         if match:
-            return platform, match.group(1)
+            return UrlInfo(platform, match.group(1), provisional)
     host = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
-    return re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-") or "web", None
+    slug = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-") or "web"
+    return UrlInfo(slug, None, False)
 
 
 def slugify(value: str) -> str:
@@ -102,8 +129,8 @@ def ingest(
     projects_root.mkdir(parents=True, exist_ok=True)
 
     if is_url(source):
-        platform, post_id = classify_url(source)
-        slug = slugify(name or f"{platform}-{post_id or 'post'}")
+        info = classify_url(source)
+        slug = slugify(name or f"{info.platform}-{info.post_id or 'post'}")
         project_dir = _unique_dir(projects_root, slug)
         project_dir.mkdir(parents=True, exist_ok=True)
         video, meta = _download(
@@ -113,7 +140,16 @@ def ingest(
             cookies_file=cookies_file,
             timeout=timeout,
         )
-        return Source(project_dir, video, source, platform, meta)
+
+        # A short link only names a redirect code. Now that yt-dlp has resolved
+        # it, rename the project after the real post id.
+        if info.provisional and not name and meta.get("id"):
+            project_dir, video = _rename_project(
+                project_dir, video, projects_root,
+                slugify(f"{info.platform}-{meta['id']}"),
+            )
+
+        return Source(project_dir, video, source, info.platform, meta)
 
     src_path = Path(source).expanduser().resolve()
     if not src_path.exists():
@@ -130,6 +166,27 @@ def ingest(
     dest = project_dir / f"source{src_path.suffix.lower()}"
     shutil.copy2(src_path, dest)
     return Source(project_dir, dest, str(src_path), "local", {})
+
+
+def _rename_project(project_dir: Path, video: Path, projects_root: Path,
+                    new_slug: str) -> tuple[Path, Path]:
+    """Move a freshly downloaded project to a better name.
+
+    Best effort: if the destination is taken or the move fails, the project
+    simply keeps the name it already has rather than failing the ingest.
+    """
+    if new_slug == project_dir.name:
+        return project_dir, video
+
+    target = projects_root / new_slug
+    if target.exists():
+        return project_dir, video
+
+    try:
+        shutil.move(str(project_dir), str(target))
+    except OSError:
+        return project_dir, video
+    return target, target / video.name
 
 
 def _download(
@@ -172,9 +229,17 @@ def _download(
     if proc.returncode != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         needs_auth = any(
-            token in err
-            for token in ("empty media response", "login required", "rate-limit",
-                          "Requested content is not available", "cookies")
+            token.lower() in err.lower()
+            for token in (
+                # Instagram
+                "empty media response", "Requested content is not available",
+                # TikTok
+                "Unable to extract webpage video data", "Video not available",
+                "unable to find video in feed", "status code 10204",
+                # Generic
+                "login required", "log in", "rate-limit", "cookies",
+                "sign in to confirm",
+            )
         )
         message = f"download failed for {url}\n{err[-1500:]}"
         if needs_auth and not (cookies_from_browser or cookies_file):

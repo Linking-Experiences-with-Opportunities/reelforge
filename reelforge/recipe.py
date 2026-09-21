@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import statistics
 from pathlib import Path
 
@@ -87,6 +88,30 @@ def _overlapping_speech(segments: list[dict], start: float, end: float) -> str:
 # certainly OCR'd out of a screenshot or a dense graphic, not a real overlay.
 MAX_CAPTION_WORDS = 8
 
+# Platform watermarks (TikTok stamps "TikTok @handle" and drifts it around the
+# frame; Instagram and YouTube do similar) are on-screen text, so OCR picks
+# them up - but they belong to the *source*, not to the video being built.
+# Seeding them as captions would burn another creator's handle into your
+# render, so they are dropped. They stay in `source_text` for reference.
+_WATERMARK_PATTERNS = [
+    re.compile(r"\btiktok\b", re.I),
+    re.compile(r"\binstagram\b", re.I),
+    re.compile(r"\byoutube\b", re.I),
+    re.compile(r"^\s*@[\w.]+\s*$"),
+]
+
+
+def _looks_like_watermark(text: str) -> bool:
+    """Is this OCR'd text a platform watermark rather than a real caption?"""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # A bare handle, or any short line naming a platform, is a watermark.
+    # A longer sentence that merely mentions TikTok is left alone.
+    if len(stripped.split()) > MAX_CAPTION_WORDS:
+        return False
+    return any(pattern.search(stripped) for pattern in _WATERMARK_PATTERNS)
+
 
 def _starting_text(source_text: str, is_asset: bool, copy_source_text: bool) -> str:
     """The `text` a fresh recipe starts with, before you edit it.
@@ -99,6 +124,8 @@ def _starting_text(source_text: str, is_asset: bool, copy_source_text: bool) -> 
     if not copy_source_text or is_asset:
         return ""
     if len(source_text.split()) > MAX_CAPTION_WORDS:
+        return ""
+    if _looks_like_watermark(source_text):
         return ""
     return source_text
 
