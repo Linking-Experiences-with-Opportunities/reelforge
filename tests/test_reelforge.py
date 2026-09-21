@@ -424,6 +424,82 @@ class TestVisualSummary(unittest.TestCase):
         self.assertEqual(summary.kind, "diagram")
 
 
+class TestDarkFootageIsNotAGraphic(unittest.TestCase):
+    """Dim footage is genuinely flat and used to be classified as a diagram."""
+
+    def _write(self, image, tmp: str, name: str) -> Path:
+        path = Path(tmp) / name
+        image.save(path)
+        return path
+
+    def _dark_room(self):
+        """A dim room: mostly shadow, but with real objects in it.
+
+        Uniform noise alone would be a bad proxy - with no large-scale
+        structure every row reads as uniform, which real footage never does.
+        The lit monitor and the chair silhouette are what break the rows up.
+        """
+        from PIL import Image, ImageDraw
+        import random
+        random.seed(7)
+        image = Image.new("RGB", (360, 640), (14, 12, 18))
+        draw = ImageDraw.Draw(image)
+        # A lit monitor, its glow, and a chair back in front of it.
+        draw.rectangle([70, 180, 290, 330], fill=(40, 70, 120))
+        draw.rectangle([90, 200, 270, 250], fill=(70, 110, 170))
+        draw.ellipse([110, 300, 250, 470], fill=(26, 24, 30))
+        draw.rectangle([0, 470, 360, 640], fill=(20, 18, 24))
+        pixels = image.load()
+        for y in range(640):
+            for x in range(360):
+                r, g, b = pixels[x, y]
+                jitter = random.randint(-7, 7)
+                pixels[x, y] = (max(0, min(255, r + jitter)),
+                                max(0, min(255, g + jitter)),
+                                max(0, min(255, b + jitter)))
+        return image
+
+    def _light_chart(self):
+        """A light background with ruled lines and filled bars - a chart."""
+        from PIL import Image, ImageDraw
+        image = Image.new("RGB", (360, 640), (250, 250, 252))
+        draw = ImageDraw.Draw(image)
+        for y in range(120, 560, 60):
+            draw.line([(30, y), (330, y)], fill=(200, 205, 214), width=3)
+        # Enough filled area to register as distinct color regions.
+        draw.rectangle([40, 180, 150, 540], fill=(66, 133, 244))
+        draw.rectangle([160, 260, 250, 540], fill=(52, 168, 83))
+        draw.rectangle([260, 340, 330, 540], fill=(234, 67, 53))
+        return image
+
+    @unittest.skipUnless(visuals.PILLOW_AVAILABLE, "needs Pillow")
+    def test_dark_low_contrast_frame_is_footage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(self._dark_room(), tmp, "dark.png")
+            metrics = visuals._metrics(path)
+            # It really does look flat - that is the whole trap.
+            self.assertGreater(metrics["flat_ratio"], 0.7)
+            self.assertLess(metrics["near_white"], 0.05)
+            self.assertLessEqual(metrics["ruled_ratio"], visuals.RULED_LINE_RATIO)
+
+            verdict = visuals.classify_frame(path, "")
+            self.assertEqual(verdict.kind, "footage")
+
+    @unittest.skipUnless(visuals.PILLOW_AVAILABLE, "needs Pillow")
+    def test_light_ruled_frame_is_still_a_graphic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(self._light_chart(), tmp, "chart.png")
+            verdict = visuals.classify_frame(path, "Revenue Signups Churn")
+            self.assertIn(verdict.kind, visuals.ASSET_KINDS)
+
+    @unittest.skipUnless(visuals.PILLOW_AVAILABLE, "needs Pillow")
+    def test_structural_evidence_is_required(self):
+        # A light background alone is enough; so are ruled lines. Neither
+        # present -> footage, however flat the frame is.
+        self.assertGreater(visuals.LIGHT_BACKGROUND_RATIO, 0.0)
+        self.assertLess(visuals.LIGHT_BACKGROUND_RATIO, 1.0)
+
+
 class TestSheetMaps(unittest.TestCase):
     def test_slot_numbers_follow_timeline_order(self):
         data = {

@@ -29,6 +29,11 @@ PALETTE_DOMINANCE_GRAPHIC = 0.45  # top-8 colors covering this much = flat palet
 RULED_LINE_RATIO = 0.06       # share of near-uniform rows/cols (tables, charts, UI)
 BORDER_UNIFORM_TOLERANCE = 12 # per-channel spread allowed in a "uniform" border
 
+# Share of near-white pixels that marks a light UI/document background. Dark
+# footage sits near zero here (a night-time frame measured 0.002) while a
+# diagram or screenshot is typically 0.4-0.95.
+LIGHT_BACKGROUND_RATIO = 0.25
+
 # A "title card" is text over a solid background. It scores like a graphic on
 # every flatness metric, but it needs no asset from the user - the renderer
 # reproduces it with a caption. These bounds separate it from a real diagram.
@@ -230,6 +235,27 @@ def classify_frame(path: Path, ocr_text: str = "") -> FrameVerdict:
             and flat >= TITLE_CARD_MIN_FLAT
             and word_count <= TITLE_CARD_MAX_WORDS):
         return FrameVerdict(0.0, "title_card", confidence, "full", None, metrics)
+
+    # Flatness alone is NOT enough to call something a diagram or screenshot.
+    #
+    # Dimly-lit footage - a room at night, a dark-graded shot - is genuinely
+    # flat: large low-contrast regions, a palette crushed toward black. It
+    # scores as high on flat_ratio and palette_dominance as a real diagram
+    # does, so an earlier version classified an entire night-time reel as four
+    # diagrams and demanded four images the user did not have.
+    #
+    # A *rendered* graphic leaves structural evidence that a camera does not:
+    # long uniform rows and columns (chart gridlines, table rules, UI chrome),
+    # a light background, or a discrete card composited onto a plain backdrop.
+    # Requiring at least one of those keeps dark footage out without weakening
+    # detection of the graphics that matter.
+    has_structure = (
+        ruled > RULED_LINE_RATIO
+        or metrics["near_white"] > LIGHT_BACKGROUND_RATIO
+        or placement == "card"
+    )
+    if not has_structure:
+        return FrameVerdict(0.0, "footage", confidence, metrics=metrics)
 
     # Screenshot vs diagram vs photo, in rough order of how much text they carry.
     if word_count >= 10 and metrics["near_white"] > 0.12:
