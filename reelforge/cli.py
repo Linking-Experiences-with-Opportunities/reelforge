@@ -119,7 +119,10 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 def cmd_show(args: argparse.Namespace) -> int:
-    data = recipe_mod.load_recipe(Path(args.recipe).expanduser())
+    target = getattr(args, "recipe_flag", None) or args.recipe
+    if not target:
+        raise ToolError("no recipe given. Use: reelforge show --recipe <path>")
+    data = recipe_mod.load_recipe(Path(target).expanduser())
     if args.json:
         _print(json.dumps(data, indent=2))
     else:
@@ -400,7 +403,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_show = sub.add_parser("show", help="print a recipe")
-    p_show.add_argument("recipe")
+    # `--recipe` matches every other subcommand; the bare positional form is
+    # kept working so older invocations do not break.
+    p_show.add_argument("recipe", nargs="?", help=argparse.SUPPRESS)
+    p_show.add_argument("--recipe", dest="recipe_flag", help="path to recipe.json")
     p_show.add_argument("--json", action="store_true", help="dump raw JSON")
     p_show.set_defaults(func=cmd_show)
 
