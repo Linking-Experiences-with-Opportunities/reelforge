@@ -40,6 +40,13 @@ class TestUrlClassification(unittest.TestCase):
         self.assertEqual(info.platform, "vimeo-com")
         self.assertIsNone(info.post_id)
 
+    def test_is_url(self):
+        self.assertTrue(ingest.is_url("https://x.com/a"))
+        self.assertFalse(ingest.is_url("/Users/me/clip.mp4"))
+
+    def test_slugify_strips_unsafe_characters(self):
+        self.assertEqual(ingest.slugify("my reel!! (final)/v2"), "my-reel-final-v2")
+
 
 class TestTikTokUrls(unittest.TestCase):
     VIDEO_ID = "7412345678901234567"
@@ -131,12 +138,6 @@ class TestProjectRename(unittest.TestCase):
                 project, video, root, "tiktok-abc")
             self.assertEqual((new_dir, new_video), (project, video))
 
-    def test_is_url(self):
-        self.assertTrue(ingest.is_url("https://x.com/a"))
-        self.assertFalse(ingest.is_url("/Users/me/clip.mp4"))
-
-    def test_slugify_strips_unsafe_characters(self):
-        self.assertEqual(ingest.slugify("my reel!! (final)/v2"), "my-reel-final-v2")
 
 
 class TestSegmentMerging(unittest.TestCase):
@@ -176,8 +177,15 @@ class TestCaptionSeeding(unittest.TestCase):
                          "STOP SCROLLING")
 
     def test_paragraph_is_not_treated_as_a_caption(self):
-        paragraph = " ".join(f"word{i}" for i in range(20))
+        paragraph = " ".join(f"word{i}" for i in range(40))
         self.assertEqual(recipe._starting_text(paragraph, False, True), "")
+
+    def test_a_two_line_lyric_caption_survives(self):
+        # Nine words across two lines. The old eight-word cap silently dropped
+        # this, leaving a reel whose captions were plainly visible on screen
+        # with no captions at all in its recipe.
+        lyric = "It's simple and it's plain The choice is yours."
+        self.assertEqual(recipe._starting_text(lyric, False, True), lyric)
 
     def test_blank_text_opt_out(self):
         self.assertEqual(recipe._starting_text("STOP SCROLLING", False, False), "")

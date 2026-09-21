@@ -45,6 +45,7 @@ class Analysis:
     transcript: list[dict] = field(default_factory=list)
     transcript_text: str = ""
     ocr_beats: list[TextBeat] = field(default_factory=list)
+    overlay_beats: list[TextBeat] = field(default_factory=list)
     frames: list[tuple[float, Path]] = field(default_factory=list)
     frame_step: float = 1.0
     visual_verdicts: list = field(default_factory=list)
@@ -64,6 +65,7 @@ class Analysis:
             "transcript": self.transcript,
             "transcript_text": self.transcript_text,
             "ocr_beats": [b.as_dict() for b in self.ocr_beats],
+            "overlay_beats": [b.as_dict() for b in self.overlay_beats],
             "notes": self.notes,
         }
 
@@ -249,20 +251,43 @@ def sample_frames(video: Path, project_dir: Path, fps: float = 1.0) -> list[tupl
     return [(index / fps, path) for index, path in enumerate(files)]
 
 
-def ocr_frames(frames: list[tuple[float, Path]]) -> tuple[dict[float, str], str | None]:
-    """OCR each sampled frame. Returns (text_by_timestamp, note)."""
+def ocr_frames(frames: list[tuple[float, Path]]
+               ) -> tuple[dict[float, str], dict[float, str], str | None]:
+    """OCR each sampled frame.
+
+    Returns (all_text_by_time, overlay_text_by_time, note). The second map
+    holds only text large enough to be a deliberate caption overlay; see
+    `_overlay_text` for why the two are kept apart.
+    """
     if not have("tesseract"):
-        return {}, "tesseract not installed - skipping on-screen text (brew install tesseract)"
+        return {}, {}, ("tesseract not installed - skipping on-screen text "
+                        "(brew install tesseract)")
     if not frames:
-        return {}, "no frames extracted for OCR"
+        return {}, {}, "no frames extracted for OCR"
+
+    frame_height = _frame_height(frames[0][1])
 
     text_by_time: dict[float, str] = {}
+    overlay_by_time: dict[float, str] = {}
     for time, frame in frames:
         proc = run(["tesseract", str(frame), "stdout", "--psm", "11", "tsv"], check=False)
         if proc.returncode != 0:
             continue
-        text_by_time[time] = _clean_ocr_tsv((proc.stdout or b"").decode("utf-8", "replace"))
-    return text_by_time, None
+        raw = (proc.stdout or b"").decode("utf-8", "replace")
+        lines = _ocr_lines(raw)
+        text_by_time[time] = _join_lines(lines)
+        overlay_by_time[time] = _overlay_text(lines, frame_height)
+    return text_by_time, overlay_by_time, None
+
+
+def _frame_height(frame: Path) -> int:
+    """Pixel height of a sampled frame; 0 when it cannot be read."""
+    try:
+        from PIL import Image
+        with Image.open(frame) as image:
+            return image.size[1]
+    except Exception:
+        return 0
 
 
 def text_beats_from_ocr(text_by_time: dict[float, str], step: float,
@@ -273,37 +298,42 @@ def text_beats_from_ocr(text_by_time: dict[float, str], step: float,
 
 MIN_WORD_CONFIDENCE = 62.0
 
+# A caption overlay is set large on purpose. Measured on a real reel, the
+# burned-in lyric captions ran 2.7-3.9% of frame height while text belonging to
+# the scene itself (a wall panel behind the subject) was 0.5-0.7%. Anything
+# below this is treated as part of the picture, not as a caption.
+CAPTION_MIN_HEIGHT_RATIO = 0.015
 
-def _clean_ocr_tsv(raw: str) -> str:
-    """Keep only words tesseract is actually confident about.
 
-    Textured footage makes tesseract hallucinate words with confidence in the
-    teens. Reading the TSV rather than plain text lets those be dropped by
-    score, which keeps invented captions out of the recipe.
+def _ocr_lines(raw: str) -> list[dict]:
+    """Parse tesseract TSV into lines that keep their geometry.
+
+    Only words tesseract is actually confident about survive: textured footage
+    makes it hallucinate words with confidence in the teens, and those would
+    otherwise become invented captions.
     """
     rows = raw.splitlines()
     if not rows:
-        return ""
+        return []
 
     header = rows[0].split("\t")
     try:
-        conf_at = header.index("conf")
-        text_at = header.index("text")
-        line_at = header.index("line_num")
-        block_at = header.index("block_num")
+        at = {name: header.index(name) for name in
+              ("conf", "text", "line_num", "block_num", "top", "height",
+               "left", "width")}
     except ValueError:
-        return ""
+        return []
 
-    lines: dict[tuple[str, str], list[str]] = {}
+    grouped: dict[tuple[str, str], dict] = {}
     for row in rows[1:]:
         columns = row.split("\t")
-        if len(columns) <= max(conf_at, text_at, line_at, block_at):
+        if len(columns) <= max(at.values()):
             continue
-        word = columns[text_at].strip()
+        word = columns[at["text"]].strip()
         if not word:
             continue
         try:
-            confidence = float(columns[conf_at])
+            confidence = float(columns[at["conf"]])
         except ValueError:
             continue
         if confidence < MIN_WORD_CONFIDENCE:
@@ -312,14 +342,61 @@ def _clean_ocr_tsv(raw: str) -> str:
         alnum = sum(c.isalnum() for c in word)
         if alnum == 0 or (len(word) > 1 and alnum / len(word) < 0.6):
             continue
-        lines.setdefault((columns[block_at], columns[line_at]), []).append(word)
 
-    parts = []
-    for words in lines.values():
-        line = " ".join(words)
-        if len(line) >= 3:
-            parts.append(line)
-    return " ".join(parts).strip()
+        try:
+            top = int(columns[at["top"]])
+            height = int(columns[at["height"]])
+            left = int(columns[at["left"]])
+            width = int(columns[at["width"]])
+        except ValueError:
+            continue
+
+        key = (columns[at["block_num"]], columns[at["line_num"]])
+        line = grouped.setdefault(key, {
+            "words": [], "height": 0, "top": top, "left": left, "right": 0,
+        })
+        line["words"].append(word)
+        line["height"] = max(line["height"], height)
+        line["top"] = min(line["top"], top)
+        line["left"] = min(line["left"], left)
+        line["right"] = max(line["right"], left + width)
+
+    lines = []
+    for line in grouped.values():
+        text = " ".join(line["words"])
+        if len(text) < 3:
+            continue
+        lines.append({**line, "text": text})
+    return lines
+
+
+def _join_lines(lines: list[dict]) -> str:
+    return " ".join(line["text"] for line in lines).strip()
+
+
+def _overlay_text(lines: list[dict], frame_height: int) -> str:
+    """Just the lines big enough to be a deliberate caption overlay.
+
+    Seeding captions from *all* on-screen text goes wrong the moment the scene
+    itself contains writing - a screen, a poster, a wall panel. That text gets
+    merged with the real overlay into one long blob, which then trips the
+    caption-length guard and the recipe ends up with no captions at all, even
+    though the source clearly had them. Sorting by size recovers the overlay.
+    """
+    if not lines or frame_height <= 0:
+        return ""
+    minimum = frame_height * CAPTION_MIN_HEIGHT_RATIO
+    big = [line for line in lines if line["height"] >= minimum]
+    if not big:
+        return ""
+    # Preserve reading order: captions stack top to bottom.
+    big.sort(key=lambda line: line["top"])
+    return " ".join(line["text"] for line in big).strip()
+
+
+def _clean_ocr_tsv(raw: str) -> str:
+    """All confident text in a frame, as one string."""
+    return _join_lines(_ocr_lines(raw))
 
 
 def _similar(a: str, b: str) -> bool:
@@ -419,10 +496,12 @@ def analyze(
 
     text_by_time: dict[float, str] = {}
     if do_ocr and result.frames:
-        text_by_time, note = ocr_frames(result.frames)
+        text_by_time, overlay_by_time, note = ocr_frames(result.frames)
         if note:
             result.notes.append(note)
         result.ocr_beats = text_beats_from_ocr(text_by_time, result.frame_step, duration)
+        result.overlay_beats = text_beats_from_ocr(
+            overlay_by_time, result.frame_step, duration)
 
     if do_visuals and result.frames:
         if not visuals.PILLOW_AVAILABLE:

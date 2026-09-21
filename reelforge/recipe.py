@@ -84,9 +84,16 @@ def _overlapping_speech(segments: list[dict], start: float, end: float) -> str:
     return " ".join(parts).strip()
 
 
-# A caption is a line, not a paragraph. Anything longer than this was almost
-# certainly OCR'd out of a screenshot or a dense graphic, not a real overlay.
-MAX_CAPTION_WORDS = 8
+# A caption is a line, not a paragraph. Captions are now seeded only from the
+# large-text overlay layer, which already excludes screenshot body text, so
+# this cap can be generous - it only guards against an OCR run-on.
+MAX_CAPTION_WORDS = 20
+
+# The watermark test applies to *short* lines only: "TikTok @handle" is a
+# stamp, while a sentence that happens to mention a platform is real copy.
+# Kept separate from MAX_CAPTION_WORDS so raising one cannot silently widen
+# the other.
+WATERMARK_MAX_WORDS = 8
 
 # Platform watermarks (TikTok stamps "TikTok @handle" and drifts it around the
 # frame; Instagram and YouTube do similar) are on-screen text, so OCR picks
@@ -108,7 +115,7 @@ def _looks_like_watermark(text: str) -> bool:
         return False
     # A bare handle, or any short line naming a platform, is a watermark.
     # A longer sentence that merely mentions TikTok is left alone.
-    if len(stripped.split()) > MAX_CAPTION_WORDS:
+    if len(stripped.split()) > WATERMARK_MAX_WORDS:
         return False
     return any(pattern.search(stripped) for pattern in _WATERMARK_PATTERNS)
 
@@ -163,6 +170,9 @@ def build_recipe(
     segments = []
     for index, (start, end) in enumerate(spans):
         source_text = _overlapping_text(analysis.ocr_beats, start, end)
+        # Captions are seeded from the overlay layer only: text belonging to
+        # the scene itself must not become a caption in the rebuild.
+        overlay_text = _overlapping_text(analysis.overlay_beats, start, end)
         speech = _overlapping_speech(analysis.transcript, start, end)
         verdict = visuals.summarize_segment(analysis.visual_verdicts, start, end)
         # A title card counts as footage: its words come back through the
@@ -177,6 +187,7 @@ def build_recipe(
             "duration": round(end - start, 3),
             "energy": _energy_for(analysis, start, end),
             "source_text": source_text,
+            "source_overlay_text": overlay_text,
             "source_speech": speech,
             # What this slot needs from you: "footage" -> a clip from --clips,
             # "asset" -> a diagram/screenshot/image from --assets.
@@ -189,7 +200,7 @@ def build_recipe(
             },
             "reference_frame": _reference_frame(analysis, start, end),
             # `text`, `clip` and `asset` are the fields you edit before rendering.
-            "text": _starting_text(source_text, is_asset, copy_source_text),
+            "text": _starting_text(overlay_text, is_asset, copy_source_text),
             "clip": None,
             "asset": None,
             "transition": "cut",
