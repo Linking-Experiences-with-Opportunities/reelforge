@@ -34,6 +34,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         cookies_file=Path(args.cookies).expanduser() if args.cookies else None,
         name=args.name,
         timeout=args.download_timeout,
+        start=ingest_mod.parse_timecode(args.start) if args.start else None,
+        duration=ingest_mod.parse_timecode(args.duration) if args.duration else None,
     )
     _print(f"-> project {source.project_dir}")
     _print(f"   video   {source.video.name}")
@@ -41,6 +43,18 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     probe = ingest_mod.probe(source.video)
     _print(f"   {probe['width']}x{probe['height']} {probe['orientation']}"
            f" @ {probe['fps']}fps  |  {probe['duration']}s")
+
+    length = float(probe.get("duration") or 0.0)
+    if length > ingest_mod.LONG_SOURCE_SECONDS and not (args.start or args.duration):
+        raise ToolError(
+            f"this source is {ingest_mod.format_timecode(length)} long.\n"
+            f"  Analysing it whole would sample about "
+            f"{int(length * args.frame_fps):,} frames and produce a recipe with "
+            f"hundreds of segments.\n"
+            f"  Pick a section instead, e.g.:\n"
+            f"    --start 1:12:30 --duration 45\n"
+            f"  (add --frame-fps 0.5 if you really do want the whole thing)"
+        )
 
     _print("   analyzing cuts, audio, on-screen text and visuals ...")
     analysis = analyze_mod.analyze(
@@ -233,6 +247,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         music=Path(args.music).expanduser() if args.music else None,
         fit=args.fit,
         asset_fit=args.asset_fit,
+        crop=args.crop,
         font=args.font,
         keep_temp=args.keep_temp,
         on_progress=_progress,
@@ -260,6 +275,8 @@ def cmd_make(args: argparse.Namespace) -> int:
         cookies=args.cookies,
         name=args.name,
         download_timeout=args.download_timeout,
+        start=args.start,
+        duration=args.duration,
         no_transcribe=args.no_transcribe,
         no_ocr=args.no_ocr,
         no_visuals=args.no_visuals,
@@ -284,6 +301,7 @@ def cmd_make(args: argparse.Namespace) -> int:
         out=args.out,
         fit=args.fit,
         asset_fit=args.asset_fit,
+        crop=args.crop,
         font=args.font,
         keep_temp=False,
         audio_mode=args.audio_mode,
@@ -358,6 +376,11 @@ def _add_ingest_options(parser: argparse.ArgumentParser) -> None:
                         help="skip on-screen text extraction")
     parser.add_argument("--no-visuals", action="store_true",
                         help="skip diagram/image detection; every segment becomes footage")
+    parser.add_argument("--start", metavar="TIMECODE",
+                        help="begin at this point in the source: SS, MM:SS or "
+                             "HH:MM:SS. For a URL only this section is downloaded.")
+    parser.add_argument("--duration", metavar="TIMECODE",
+                        help="how much of the source to take from --start")
     parser.add_argument("--sheet-columns", type=int, default=5,
                         help="columns in the generated contact sheet (default: 5)")
     parser.add_argument("--frame-fps", type=float, default=2.0,
@@ -380,6 +403,10 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--music", metavar="FILE", help="audio track to lay under the render")
     parser.add_argument("--fit", default="cover", choices=["cover", "contain", "blur"],
                         help="how footage fills the frame (default: cover)")
+    parser.add_argument("--crop", metavar="X,Y,W,H",
+                        help="crop every footage clip before fitting. Pixels, or "
+                             "percentages like '1%%,69%%,7%%,29%%' to pull a facecam "
+                             "out of a screen capture.")
     parser.add_argument("--asset-fit", default="blur", choices=["cover", "contain", "blur"],
                         help="how images/diagrams fill the frame; 'blur' and 'contain' "
                              "never crop them (default: blur)")
