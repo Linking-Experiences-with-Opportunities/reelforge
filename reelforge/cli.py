@@ -13,6 +13,7 @@ from . import ingest as ingest_mod
 from . import recipe as recipe_mod
 from . import render as render_mod
 from . import sheet as sheet_mod
+from . import sync as sync_mod
 from .shell import ToolError, have
 
 DEFAULT_PROJECTS = Path.home() / "reelforge-projects"
@@ -316,6 +317,62 @@ def cmd_make(args: argparse.Namespace) -> int:
 # doctor
 # --------------------------------------------------------------------------- #
 
+def _fmt_time(seconds: float) -> str:
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    return f"{sign}{int(seconds // 60)}:{seconds % 60:05.2f}"
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    videos = sync_mod.expand(args.videos, sync_mod.VIDEO_EXTS)
+    takes = sync_mod.expand(args.takes, sync_mod.AUDIO_EXTS)
+    if not videos:
+        raise ToolError("no video files found in --videos")
+    if not takes:
+        raise ToolError("no audio takes found in --takes")
+    _print(f"-> {len(videos)} video(s) x {len(takes)} take(s)")
+    results = sync_mod.match_all(
+        videos, takes,
+        log=lambda m: _print(m),
+        snippet=args.snippet, probes=args.probes,
+        tolerance=args.tolerance, min_score=args.min_score,
+    )
+
+    _print()
+    _print(f"  {'video':<28} {'take':<24} {'offset':>9} {'score':>6} "
+           f"{'probes':>6}  clean audio (video time)")
+    for r in results:
+        name = Path(r.video).name[:28]
+        if r.take is None:
+            _print(f"  {name:<28} {'- no match':<24} {'':>9} {'':>6} "
+                   f"{r.agreeing:>3}/{len(r.probes):<2}  camera audio only")
+            continue
+        c0, c1 = r.coverage or (0.0, 0.0)
+        _print(f"  {name:<28} {Path(r.take).name[:24]:<24} "
+               f"{r.offset:>+9.2f} {r.score:>6.2f} {r.agreeing:>3}/{len(r.probes):<2}  "
+               f"{_fmt_time(c0)} -> {_fmt_time(c1)} of {_fmt_time(r.video_duration)}")
+    _print()
+    _print("  offset: take_time = video_time + offset")
+
+    if args.report:
+        sync_mod.write_report(results, Path(args.report).expanduser())
+        _print(f"-> report {args.report}")
+
+    if args.out_dir:
+        out_dir = Path(args.out_dir).expanduser()
+        # one at a time: parallel muxes of big files have filled the disk and
+        # silently truncated outputs before.
+        for r in results:
+            if r.take is None:
+                continue
+            out = out_dir / (Path(r.video).stem + args.suffix + ".mp4")
+            _print(f"   muxing   {out.name}")
+            sync_mod.mux(r, out, bitrate=args.bitrate,
+                         keep_camera_gaps=not args.no_camera_fill)
+        _print(f"-> synced videos in {out_dir}")
+    return 0
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     checks = [
         ("ffmpeg", True, "brew install ffmpeg", "render + analyze"),
@@ -471,6 +528,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ingest_options(p_make)
     _add_render_options(p_make)
     p_make.set_defaults(func=cmd_make)
+
+    p_sync = sub.add_parser(
+        "sync", help="match camera videos to separately recorded audio takes, and mux them")
+    p_sync.add_argument("--videos", nargs="+", required=True, metavar="PATH",
+                        help="camera files and/or directories of them")
+    p_sync.add_argument("--takes", nargs="+", required=True, metavar="PATH",
+                        help="recorder audio files and/or directories of them")
+    p_sync.add_argument("--out-dir", metavar="DIR",
+                        help="write synced copies here (video stream copied, audio replaced)")
+    p_sync.add_argument("--report", metavar="FILE", help="write the matches as JSON")
+    p_sync.add_argument("--snippet", type=float, default=30.0,
+                        help="probe length in seconds (default: 30)")
+    p_sync.add_argument("--probes", type=int, default=3,
+                        help="probes per video; at least 2 must agree (default: 3)")
+    p_sync.add_argument("--tolerance", type=float, default=1.0,
+                        help="how closely probe offsets must agree, seconds (default: 1.0)")
+    p_sync.add_argument("--min-score", type=float, default=0.3,
+                        help="minimum correlation for a probe to count (default: 0.3)")
+    p_sync.add_argument("--bitrate", default="192k", help="AAC bitrate (default: 192k)")
+    p_sync.add_argument("--suffix", default="", help="added to output file names")
+    p_sync.add_argument("--no-camera-fill", action="store_true",
+                        help="leave uncovered stretches silent instead of using camera audio")
+    p_sync.set_defaults(func=cmd_sync)
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)

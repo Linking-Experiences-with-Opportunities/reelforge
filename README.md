@@ -158,6 +158,44 @@ error: this recipe needs 2 image/diagram(s); you supplied 1.
 reelforge make ./some-reel.mp4 --clips ./my-footage --assets a.png b.png --out out.mp4
 ```
 
+### Sync camera footage to a separate audio recorder
+
+Shot on a camera with a field recorder running alongside (podcasts, interviews)?
+`sync` works out which recorder take goes with which camera file, and where:
+
+```bash
+reelforge sync --videos ./camera --takes ./recorder \
+  --report sync.json --out-dir ./synced
+```
+
+```
+  video          take                 offset  score probes  clean audio (video time)
+  C0006.MP4      2026_0707_0133.WAV  +1895.77  1.00   2/3   0:00.00 -> 3:29.37 of 3:51.74
+  C0011.MP4      2026_0707_0133.WAV    -40.02  1.00   3/3   0:40.02 -> 29:50.80 of 29:50.80
+  C0004.MP4      - no match                             0/3   camera audio only
+
+  offset: take_time = video_time + offset
+```
+
+It matches by **sound, not clocks**: device timestamps from two different
+devices don't agree, so pairing by file time goes badly wrong. Both sides are
+reduced to a voice-band loudness envelope (250–3400 Hz, 8 kHz, 20 ms hop), then
+several 30s probes from the video are slid along every take with normalised
+cross-correlation. A pairing only counts when **at least two probes agree** on
+the offset to within `--tolerance` (1s) — one strong peak can be chance, two
+independent probes agreeing on the spacing is not.
+
+With `--out-dir`, each matched video is rewritten with the video stream copied
+untouched and the take as AAC 192k audio. Where the recorder wasn't running
+(started late, stopped early) the camera's own audio fills in, unless you pass
+`--no-camera-fill`. Files are muxed **one at a time** and each output's duration
+is checked against the source — parallel muxes of big files have filled a disk
+and silently truncated outputs before. Sources are never deleted.
+
+Recorder folders with per-mic tracks (`MIC1.WAV`…) work too: point `--takes` at
+the mixed stereo file or at the mic you want. numpy is used for the FFT when
+installed; without it a pure-Python FFT handles a 35-minute take in a few seconds.
+
 ---
 
 ## The recipe
@@ -245,6 +283,7 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 | `make <file\|url>` | ingest and render in one step |
 | `sheet --recipe R` | rebuild the contact sheet (`--columns`, `--plain`) |
 | `show --recipe R` | print a recipe (`--json` for raw) |
+| `sync --videos V --takes T` | pair camera files with recorder takes by audio; `--out-dir` muxes them |
 | `doctor` | check tools and caption backend |
 
 Useful flags: `--fit`/`--asset-fit` (`cover`, `contain`, `blur`), `--no-captions`,
@@ -273,6 +312,7 @@ reelforge/
   captions.py   Pillow caption rasterizer (no libfreetype needed)
   sheet.py      contact sheet artifact
   render.py     recipe + media -> mp4
+  sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   cli.py        argparse front end
 tools/
   make_fixture.py   synthetic test reel generator

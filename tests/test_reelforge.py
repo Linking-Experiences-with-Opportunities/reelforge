@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reelforge import analyze, captions, ingest, recipe, render, sheet, visuals
+from reelforge import analyze, captions, ingest, recipe, render, sheet, sync, visuals
 
 
 class TestUrlClassification(unittest.TestCase):
@@ -563,6 +563,76 @@ class TestClipCollection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(Exception):
                 render.collect_clips([tmp])
+
+
+def _speechy(n: int, seed: int) -> list[float]:
+    """Bursty, envelope-like noise: syllables with gaps, never repeating."""
+    import random
+    rng = random.Random(seed)
+    out, level = [], 0.0
+    for _ in range(n):
+        if rng.random() < 0.08:
+            level = rng.random() if rng.random() < 0.7 else 0.0
+        out.append(max(0.0, level + rng.gauss(0, 0.05)))
+    return out
+
+
+class TestSync(unittest.TestCase):
+    RATE = sync.ENVELOPE_RATE
+
+    def test_fft_fallback_matches_naive_correlation(self):
+        saved = sync._np
+        sync._np = None
+        try:
+            track = _speechy(300, 1)
+            snip = _speechy(40, 2)
+            got = sync._raw_xcorr(snip, track)
+        finally:
+            sync._np = saved
+        want = [sum(s * track[lag + i] for i, s in enumerate(snip))
+                for lag in range(len(track) - len(snip) + 1)]
+        self.assertEqual(len(got), len(want))
+        for g, w in zip(got, want):
+            self.assertAlmostEqual(g, w, places=6)
+
+    def test_best_lag_is_gain_invariant(self):
+        track = _speechy(3000, 3)
+        snip = [x * 0.2 + 0.05 for x in track[1234:1234 + 500]]  # quieter mic, DC
+        lag, score = sync.best_lag(snip, track)
+        self.assertEqual(lag, 1234)
+        self.assertGreater(score, 0.99)
+
+    def test_match_recovers_offset_with_head_the_take_misses(self):
+        take = _speechy(60 * self.RATE, 4)
+        # video: 10s the recorder never heard, then take[20s:50s] -> offset +10
+        video = _speechy(10 * self.RATE, 5) + take[20 * self.RATE:50 * self.RATE]
+        offset, score, agreeing, probes = sync.match_envelopes(
+            video, take, snippet=8, probes=3)
+        self.assertEqual(len(probes), 3)
+        self.assertGreaterEqual(agreeing, 2)
+        self.assertAlmostEqual(offset, 10.0, places=1)
+        self.assertGreater(score, 0.9)
+
+    def test_unrelated_audio_is_rejected(self):
+        offset, _score, agreeing, _ = sync.match_envelopes(
+            _speechy(40 * self.RATE, 6), _speechy(120 * self.RATE, 7),
+            snippet=10, probes=3)
+        self.assertIsNone(offset)
+        self.assertLess(agreeing, 2)
+
+    def test_coverage(self):
+        # recorder started 20s into the video and ran past its end
+        self.assertEqual(sync.coverage(-20.0, 100.0, 500.0), (20.0, 100.0))
+        # recorder stopped 30s before the video ended
+        self.assertEqual(sync.coverage(100.0, 100.0, 170.0), (0.0, 70.0))
+        self.assertIsNone(sync.coverage(-200.0, 100.0, 50.0))
+
+    def test_probe_positions(self):
+        self.assertEqual(sync.probe_positions(20, 30, 3), [0.0])
+        pos = sync.probe_positions(130, 30, 3)
+        self.assertEqual(len(pos), 3)
+        self.assertTrue(all(0 <= p <= 100 for p in pos))
+        self.assertLess(pos[0], pos[1])
 
 
 if __name__ == "__main__":
