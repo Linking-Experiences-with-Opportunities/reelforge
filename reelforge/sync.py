@@ -151,6 +151,10 @@ class Probe:
     video_time: float
     offset: float
     score: float
+    # set once the match is decided: "agrees", "disagrees", "weak" (score under
+    # --min-score) or "outside take" (at the matched offset this snippet falls
+    # before the take starts or after it ends, so it had nothing to match).
+    status: str = ""
 
 
 @dataclass
@@ -211,15 +215,60 @@ def coverage(offset: float, video_duration: float,
     return (round(start, 3), round(end, 3)) if end > start else None
 
 
-def expand(paths: list[str], exts: set[str]) -> list[Path]:
-    """Files as given; directories expanded (non-recursively) by extension."""
+OUTSIDE = "outside take"
+
+
+def classify_probes(probes: list[Probe], offset: float, *, snippet: float,
+                    take_duration: float, video_duration: float,
+                    tolerance: float = 1.0, min_score: float = 0.3) -> None:
+    """Label every probe of a decided match (sets ``Probe.status`` in place).
+
+    A probe that sits past the end of the take (camera kept rolling after the
+    recorder stopped) or before its start could never have matched, so it is
+    reported as "outside take" rather than counted as a disagreement.
+    """
+    width = min(snippet, video_duration)
+    for p in probes:
+        start = p.video_time + offset
+        if start < -0.5 or start + width > take_duration + 0.5:
+            p.status = OUTSIDE
+        elif p.score < min_score:
+            p.status = "weak"
+        elif abs(p.offset - offset) <= tolerance:
+            p.status = "agrees"
+        else:
+            p.status = "disagrees"
+
+
+def probe_note(match: "Match") -> str:
+    """Short explanation for probes that did not agree, e.g. '1 outside take'."""
+    counts: dict[str, int] = {}
+    for p in match.probes:
+        if p.status and p.status != "agrees":
+            counts[p.status] = counts.get(p.status, 0) + 1
+    return ", ".join(f"{n} {k}" for k, n in counts.items())
+
+
+def expand(paths: list[str], exts: set[str],
+           fallback: set[str] | None = None) -> list[Path]:
+    """Files as given; directories expanded (non-recursively) by extension.
+
+    If a directory holds nothing matching ``exts`` but does hold ``fallback``
+    files, those are used instead (e.g. a folder of audio already extracted
+    from the camera clips).
+    """
     out: list[Path] = []
     for raw in paths:
         p = Path(raw).expanduser()
         if p.is_dir():
-            out += sorted(c for c in p.iterdir()
-                          if c.is_file() and c.suffix.lower() in exts
-                          and not c.name.startswith("."))
+            def pick(want: set[str]) -> list[Path]:
+                return sorted(c for c in p.iterdir()
+                              if c.is_file() and c.suffix.lower() in want
+                              and not c.name.startswith("."))
+            found = pick(exts)
+            if not found and fallback:
+                found = pick(fallback)
+            out += found
         elif p.is_file():
             out.append(p)
         else:
@@ -229,6 +278,13 @@ def expand(paths: list[str], exts: set[str]) -> list[Path]:
 
 def duration_of(path: Path) -> float:
     return float(ffprobe_json(path).get("format", {}).get("duration") or 0.0)
+
+
+def has_video_stream(path: Path) -> bool:
+    streams = ffprobe_json(path).get("streams", [])
+    return any(s.get("codec_type") == "video"
+               and not (s.get("disposition") or {}).get("attached_pic")
+               for s in streams)
 
 
 def match_all(videos: list[Path], takes: list[Path], *, log=print,
@@ -256,6 +312,15 @@ def match_all(videos: list[Path], takes: list[Path], *, log=print,
                     coverage=coverage(offset, v_dur, len(t_env) / ENVELOPE_RATE),
                     probes=probes,
                 )
+        if best.take is not None:
+            classify_probes(
+                best.probes, best.offset,
+                snippet=kwargs.get("snippet", 30.0),
+                take_duration=len(take_envs[Path(best.take)]) / ENVELOPE_RATE,
+                video_duration=v_dur,
+                tolerance=kwargs.get("tolerance", 1.0),
+                min_score=kwargs.get("min_score", 0.3),
+            )
         results.append(best)
     return results
 
@@ -273,6 +338,9 @@ def mux(match: Match, out_path: Path, *, bitrate: str = "192k",
     """
     if match.take is None or match.offset is None or match.coverage is None:
         raise ToolError(f"{Path(match.video).name}: no matched take to mux")
+    if not has_video_stream(Path(match.video)):
+        raise ToolError(f"{Path(match.video).name}: has no video stream to mux "
+                        "(audio-only input; use the report instead)")
     dur = match.video_duration
     off = match.offset
     c0, c1 = match.coverage

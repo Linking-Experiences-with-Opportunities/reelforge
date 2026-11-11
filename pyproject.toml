@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reelforge"
+version = "0.2.0"
+description = "Study a short video's structure and rebuild it with your own footage; sync and label podcast multitrack."
+requires-python = ">=3.10"
+# Pillow is needed for captions, diagram detection and the contact sheet.
+# ffmpeg/ffprobe (and optionally yt-dlp, whisper, tesseract) come from PATH.
+dependencies = ["Pillow"]
+
+[project.optional-dependencies]
+# Splitting two voices that share one mic (`reelforge speakers` with A/B=MIC).
+# resemblyzer pulls in torch; its webrtcvad dependency still imports
+# pkg_resources, which newer setuptools removed.
+speakers = ["numpy", "resemblyzer", "setuptools<70"]
+
+[project.scripts]
+reelforge = "reelforge.cli:main"
+
+[tool.setuptools]
+packages = ["reelforge"]

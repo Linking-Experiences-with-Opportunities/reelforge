@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reelforge import analyze, captions, ingest, recipe, render, sheet, sync, visuals
+from reelforge import analyze, captions, ingest, recipe, render, sheet, speakers, sync, visuals
 
 
 class TestUrlClassification(unittest.TestCase):
@@ -633,6 +633,135 @@ class TestSync(unittest.TestCase):
         self.assertEqual(len(pos), 3)
         self.assertTrue(all(0 <= p <= 100 for p in pos))
         self.assertLess(pos[0], pos[1])
+
+    def test_probe_status_marks_probe_past_take_end(self):
+        # camera ran 4 min past the recorder: the last probe has no take audio
+        probes = [sync.Probe(80.0, -22.0, 0.9), sync.Probe(420.0, -22.1, 0.88),
+                  sync.Probe(815.0, 310.0, 0.12)]
+        sync.classify_probes(probes, -22.05, snippet=30, take_duration=670,
+                             video_duration=935)
+        self.assertEqual([p.status for p in probes],
+                         ["agrees", "agrees", sync.OUTSIDE])
+        m = sync.Match(video="v", take="t", probes=probes)
+        self.assertEqual(sync.probe_note(m), "1 outside take")
+
+    def test_probe_status_weak_and_disagrees(self):
+        probes = [sync.Probe(10.0, 5.0, 0.9), sync.Probe(50.0, 5.2, 0.8),
+                  sync.Probe(90.0, 40.0, 0.7), sync.Probe(130.0, 5.0, 0.1)]
+        sync.classify_probes(probes, 5.1, snippet=30, take_duration=1000,
+                             video_duration=200)
+        self.assertEqual([p.status for p in probes],
+                         ["agrees", "agrees", "disagrees", "weak"])
+
+    def test_expand_falls_back_to_audio_when_dir_has_no_video(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("a.wav", "b.wav", ".hidden.wav", "notes.txt"):
+                Path(d, n).write_bytes(b"")
+            got = sync.expand([d], sync.VIDEO_EXTS, fallback=sync.AUDIO_EXTS)
+            self.assertEqual([p.name for p in got], ["a.wav", "b.wav"])
+            Path(d, "c.mp4").write_bytes(b"")
+            got = sync.expand([d], sync.VIDEO_EXTS, fallback=sync.AUDIO_EXTS)
+            self.assertEqual([p.name for p in got], ["c.mp4"])
+
+
+class TestSpeakers(unittest.TestCase):
+    def test_parse_mic_and_anchor(self):
+        m = speakers.parse_mic("David/Papa=/x/MIC3.WAV")
+        self.assertEqual((m.names, m.label, m.path.name), (["David", "Papa"], "David/Papa", "MIC3.WAV"))
+        self.assertEqual(speakers.parse_mic("Max=MIC1.WAV").names, ["Max"])
+        with self.assertRaises(ValueError):
+            speakers.parse_mic("MIC1.WAV")
+        with self.assertRaises(ValueError):
+            speakers.parse_mic("A/A=MIC1.WAV")
+        self.assertEqual(speakers.parse_anchor("Papa=28.5"), ("Papa", 28.5))
+        self.assertEqual(speakers.parse_anchor("Papa=1:02:03"), ("Papa", 3723.0))
+
+    def test_parse_both_whisper_formats(self):
+        cpp = {"transcription": [
+            {"offsets": {"from": 500, "to": 2400}, "text": " Hi there."},
+            {"offsets": {"from": 2400, "to": 2400}, "text": "zero length"},
+            {"offsets": {"from": 3000, "to": 4000}, "text": "  "}]}
+        py = {"segments": [{"start": 0.5, "end": 2.4, "text": " Hi there."}]}
+        for data in (cpp, py):
+            segs = speakers.parse_transcript(data)
+            self.assertEqual([(s.start, s.end, s.text) for s in segs], [(0.5, 2.4, "Hi there.")])
+        with self.assertRaises(ValueError):
+            speakers.parse_transcript({"text": "x"})
+
+    def test_loudest_mic_wins(self):
+        rate = speakers.ENERGY_RATE
+        a = [1.0] * (2 * rate) + [0.01] * (2 * rate)      # A talks 0-2s
+        b = [0.02] * (2 * rate) + [0.8] * (2 * rate)      # B talks 2-4s
+        segs = [speakers.Segment(0.2, 1.8, "one"), speakers.Segment(2.1, 3.9, "two")]
+        speakers.assign_loudest(segs, {"A": a, "B": b})
+        self.assertEqual([s.mic for s in segs], ["A", "B"])
+
+    def test_text_merges_turns_and_srt_shifts_into_video_time(self):
+        segs = [speakers.Segment(0.5, 2.0, "Hi.", "Max"),
+                speakers.Segment(2.0, 3.0, "I'm Max.", "Max"),
+                speakers.Segment(65.0, 66.5, "Hey.", "David")]
+        txt = speakers.to_text(segs, ["Title"])
+        self.assertEqual(txt, "Title\n\n[0:00:00] Max: Hi. I'm Max.\n\n[0:01:05] David: Hey.\n")
+        # take_time = video_time + offset; offset -6.5 -> video is 6.5s later
+        srt = speakers.to_srt(segs, shift=-6.5, duration=70.0)
+        self.assertIn("00:00:07,000 --> 00:00:08,500\nMax: Hi.", srt)
+        self.assertNotIn("David", srt)        # 71.5s is past the 70s video
+        # positive offset drops cues from before the video started
+        self.assertNotIn("Hi.", speakers.to_srt(segs, shift=10.0))
+
+    def test_matches_for_take_exact_then_unique_stem(self):
+        report = [{"video": "/a/C0001.MP4", "take": "/x/2026_1108_1938.wav", "offset": -6.5},
+                  {"video": "/b/C0199.MP4", "take": "/x/2026_1108_1938.wav", "offset": -5.2},
+                  {"video": "/a/C0002.MP4", "take": "/x/2026_1108_2010.wav", "offset": 13.2},
+                  {"video": "/a/C0003.MP4", "take": None, "offset": None}]
+        names = lambda rows: [Path(r["video"]).name for r in rows]
+        self.assertEqual(names(speakers.matches_for_take(report, Path("/x/2026_1108_1938.wav"))),
+                         ["C0001.MP4", "C0199.MP4"])
+        # the original WAV, when sync ran on a resampled copy with the same stem
+        self.assertEqual(names(speakers.matches_for_take(report, Path("/sd/2026_1108_1938.WAV"))),
+                         ["C0001.MP4", "C0199.MP4"])
+
+    def test_matches_for_take_rejects_ambiguous_stem(self):
+        report = [{"video": "/a/C0001.MP4", "take": "/takeA/MIC1.WAV", "offset": -6.5},
+                  {"video": "/a/C0002.MP4", "take": "/takeB/MIC1.WAV", "offset": 40.0}]
+        # exact path still works
+        got = speakers.matches_for_take(report, Path("/takeB/MIC1.WAV"))
+        self.assertEqual([r["offset"] for r in got], [40.0])
+        with self.assertRaises(speakers.ToolError):
+            speakers.matches_for_take(report, Path("/elsewhere/MIC1.WAV"))
+
+    def test_camera_srt_names_never_collide(self):
+        self.assertEqual(speakers.camera_srt_names([Path("/m/C0199.MP4"), Path("/d/C0001.MP4")]),
+                         ["C0199", "C0001"])
+        self.assertEqual(
+            speakers.camera_srt_names([Path("/Max Cam/C0001.MP4"), Path("/David Cam/C0001.MP4")]),
+            ["Max Cam-C0001", "David Cam-C0001"])
+        # a camera named like the take transcript would overwrite it
+        self.assertEqual(speakers.camera_srt_names([Path("/cam/take.MP4")], reserved={"take"}),
+                         ["cam-take"])
+        with self.assertRaises(speakers.ToolError):
+            speakers.camera_srt_names([Path("/cam/C1.MP4"), Path("/cam/C1.mov")])
+
+    def test_seed_indices_rejects_anchors_on_one_segment(self):
+        mic = speakers.Mic(Path("MIC3.WAV"), ["David", "Papa"])
+        segs = [speakers.Segment(20.0, 27.0, "I'm David"), speakers.Segment(28.0, 33.0, "I'm Papa")]
+        self.assertEqual(speakers.seed_indices(segs, mic, {"David": 22.5, "Papa": 28.5}), [0, 1])
+        with self.assertRaises(speakers.ToolError):
+            speakers.seed_indices(segs, mic, {"David": 21.0, "Papa": 25.0})
+        with self.assertRaises(speakers.ToolError):    # nowhere near any speech
+            speakers.seed_indices(segs, mic, {"David": 22.5, "Papa": 400.0})
+
+    @unittest.skipIf(sync._np is None, "numpy not installed")
+    def test_anchored_kmeans_names_clusters_by_seed(self):
+        import random
+        rng = random.Random(1)
+        def near(c):
+            return [x + rng.gauss(0, 0.15) for x in c]
+        a, b = [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]
+        vecs = [near(a) for _ in range(20)] + [near(b) for _ in range(8)]
+        labels = speakers.anchored_kmeans(vecs, [vecs[25], vecs[3]])  # seed order: b, a
+        self.assertEqual(labels[:20], [1] * 20)
+        self.assertEqual(labels[20:], [0] * 8)
 
 
 if __name__ == "__main__":
