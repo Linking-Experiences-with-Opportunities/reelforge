@@ -15,7 +15,17 @@ The source is a template, not the content.
 
 ## Install
 
-Nothing to build. You need these on `PATH`:
+Put `reelforge` on your `PATH` (editable, so a `git pull` is picked up):
+
+```bash
+uv tool install -e .                               # or: pipx install -e .
+uv tool install -e '.[speakers]' --python 3.11     # + voice splitting for shared mics
+```
+
+Or skip installing and run `./bin/reelforge` from the repo. Plain
+`python3 -m reelforge` only works from inside the repo folder.
+
+You also need these on `PATH`:
 
 | tool | required | for |
 |---|---|---|
@@ -196,6 +206,75 @@ Recorder folders with per-mic tracks (`MIC1.WAV`…) work too: point `--takes` a
 the mixed stereo file or at the mic you want. numpy is used for the FFT when
 installed; without it a pure-Python FFT handles a 35-minute take in a few seconds.
 
+**Matching without the full videos.** Camera files are big. `--videos` also takes
+audio pulled out of them (`ffmpeg -i C0001.MP4 -vn -ac 1 -ar 16000 C0001.wav`),
+which matches exactly the same: a folder with no video files falls back to its
+audio files. Those can't be muxed, so `--out-dir` skips them; use `--report`.
+
+**Reading the probes column.** `3/3` means every probe agreed. Anything less
+gets a note:
+
+| note | meaning |
+|---|---|
+| `outside take` | at the matched offset, that probe sits where the recorder wasn't running (the camera rolled longer or started earlier). Expected; not a weak match. |
+| `weak` | the probe's best correlation was under `--min-score` (silence, music, crosstalk). |
+| `disagrees` | the probe found a different offset. One is tolerable; if it's common, check the pairing by ear. |
+
+#### The report (`--report sync.json`)
+
+A JSON list with one object per video (comments added here for reading):
+
+```jsonc
+{
+  "video": "/cam/C0006.MP4",
+  "take": "/rec/2026_1108_2246.WAV",   // null when nothing matched
+  "offset": -22.69,                     // take_time = video_time + offset, seconds
+  "score": 0.88,                        // mean correlation of the agreeing probes
+  "agreeing": 2,
+  "coverage": [22.69, 691.99],          // part of the video the take covers (video time)
+  "video_duration": 935.94,
+  "probes": [
+    {"video_time": 90.5,  "offset": -22.68, "score": 0.86, "status": "agrees"},
+    {"video_time": 452.9, "offset": -22.70, "score": 0.90, "status": "agrees"},
+    {"video_time": 815.4, "offset": 301.2,  "score": 0.11, "status": "outside take"}
+  ]
+}
+```
+
+For an unmatched video, `offset` and `coverage` are `null`, `score` is `0`, and
+its probes have no `status`.
+
+### Label who's speaking (multitrack recorders)
+
+If the recorder wrote one track per mic (Zoom PodTrak `P4_Multitrack/<take>/MIC1.WAV`…),
+`speakers` turns a transcript of the take into a speaker-labelled one. Each
+segment goes to whoever's mic is loudest:
+
+```bash
+whisper-cli -m ggml-large-v3-turbo.bin -f take.wav -oj -ml 90 -sow -of take   # short segments
+reelforge speakers --transcript take.json \
+  --mic Max=MIC1.WAV --mic Brian=MIC2.WAV --mic "David/Papa=MIC3.WAV" \
+  --anchor David=22.5 --anchor Papa=28.5 \
+  --take take.WAV --sync-report sync.json --out-dir labelled/
+```
+
+This writes `take.txt` (one paragraph per turn, like `[0:01:07] Max: …`),
+`take.srt` (`Max: …` cues) and `take.speakers.json`. With `--sync-report` it also
+writes one `.srt` per camera file matched to that take, already shifted into that
+video's own time.
+
+Two people on one mic (`"David/Papa=MIC3.WAV"`) can't be told apart by level, so
+that mic's segments are split by voice. Each segment is embedded with resemblyzer
+and clustered with k-means, seeded from the `--anchor` moments: a time in the
+take where that person is clearly talking, such as their introduction. Because
+of the seeding, every cluster comes out already named. This needs the
+`speakers` extras. On a 4-person AfroTech panel it agreed with a hand-checked
+labelling on 508 of 513 segments, and the misses were one-word fragments.
+
+Use short transcript segments (`-ml 90 -sow`), because a segment where two people
+talk goes to whoever is loudest overall. Run it once per take, since who's on
+which mic can change between takes.
+
 ---
 
 ## The recipe
@@ -284,6 +363,7 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 | `sheet --recipe R` | rebuild the contact sheet (`--columns`, `--plain`) |
 | `show --recipe R` | print a recipe (`--json` for raw) |
 | `sync --videos V --takes T` | pair camera files with recorder takes by audio; `--out-dir` muxes them |
+| `speakers --transcript J --mic N=MIC …` | label a take's transcript by speaker from per-mic tracks; per-camera SRTs |
 | `doctor` | check tools and caption backend |
 
 Useful flags: `--fit`/`--asset-fit` (`cover`, `contain`, `blur`), `--no-captions`,
@@ -313,6 +393,7 @@ reelforge/
   sheet.py      contact sheet artifact
   render.py     recipe + media -> mp4
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
+  speakers.py   speaker labels from per-mic tracks, voice split for shared mics
   cli.py        argparse front end
 tools/
   make_fixture.py   synthetic test reel generator

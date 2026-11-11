@@ -13,6 +13,7 @@ from . import ingest as ingest_mod
 from . import recipe as recipe_mod
 from . import render as render_mod
 from . import sheet as sheet_mod
+from . import speakers as speakers_mod
 from . import sync as sync_mod
 from .shell import ToolError, have
 
@@ -324,7 +325,8 @@ def _fmt_time(seconds: float) -> str:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    videos = sync_mod.expand(args.videos, sync_mod.VIDEO_EXTS)
+    videos = sync_mod.expand(args.videos, sync_mod.VIDEO_EXTS,
+                             fallback=sync_mod.AUDIO_EXTS)
     takes = sync_mod.expand(args.takes, sync_mod.AUDIO_EXTS)
     if not videos:
         raise ToolError("no video files found in --videos")
@@ -350,9 +352,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
         c0, c1 = r.coverage or (0.0, 0.0)
         _print(f"  {name:<28} {Path(r.take).name[:24]:<24} "
                f"{r.offset:>+9.2f} {r.score:>6.2f} {r.agreeing:>3}/{len(r.probes):<2}  "
-               f"{_fmt_time(c0)} -> {_fmt_time(c1)} of {_fmt_time(r.video_duration)}")
+               f"{_fmt_time(c0)} -> {_fmt_time(c1)} of {_fmt_time(r.video_duration)}"
+               + (f"   ({note})" if (note := sync_mod.probe_note(r)) else ""))
     _print()
     _print("  offset: take_time = video_time + offset")
+    if any(p.status == sync_mod.OUTSIDE for r in results for p in r.probes):
+        _print("  outside take: that probe landed where the recorder wasn't running "
+               "(camera rolled longer); expected, not a weak match")
 
     if args.report:
         sync_mod.write_report(results, Path(args.report).expanduser())
@@ -362,14 +368,73 @@ def cmd_sync(args: argparse.Namespace) -> int:
         out_dir = Path(args.out_dir).expanduser()
         # one at a time: parallel muxes of big files have filled the disk and
         # silently truncated outputs before.
+        muxed = 0
         for r in results:
             if r.take is None:
+                continue
+            if not sync_mod.has_video_stream(Path(r.video)):
+                _print(f"   skip     {Path(r.video).name} (audio only, nothing to mux)")
                 continue
             out = out_dir / (Path(r.video).stem + args.suffix + ".mp4")
             _print(f"   muxing   {out.name}")
             sync_mod.mux(r, out, bitrate=args.bitrate,
                          keep_camera_gaps=not args.no_camera_fill)
-        _print(f"-> synced videos in {out_dir}")
+            muxed += 1
+        _print(f"-> {muxed} synced video(s) in {out_dir}" if muxed
+               else "-> nothing muxed (no matched file had a video stream)")
+    return 0
+
+
+def cmd_speakers(args: argparse.Namespace) -> int:
+    mics = [speakers_mod.parse_mic(m) for m in args.mic]
+    for m in mics:
+        if not m.path.is_file():
+            raise ToolError(f"mic track not found: {m.path}")
+    anchors = dict(speakers_mod.parse_anchor(a) for a in args.anchor or [])
+    known = {n for m in mics for n in m.names}
+    if unknown := [n for n in anchors if n not in known]:
+        raise ToolError(f"--anchor for {', '.join(unknown)}, who is on no --mic")
+    transcript = Path(args.transcript).expanduser()
+    segments = speakers_mod.load_transcript(transcript)
+    _print(f"-> {len(segments)} segments, {len(mics)} mic(s)")
+    speakers_mod.label(segments, mics, anchors, log=_print)
+
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = args.name or transcript.stem
+    header = [args.title] if args.title else []
+    if args.take:
+        header.append(f"Timestamps follow the take ({Path(args.take).name}).")
+
+    report_rows = []
+    if args.sync_report:
+        if not args.take:
+            raise ToolError("--sync-report needs --take to know which matches apply")
+        report = json.loads(Path(args.sync_report).expanduser().read_text("utf-8"))
+        report_rows = speakers_mod.matches_for_take(report, Path(args.take))
+        if not report_rows:
+            raise ToolError(f"no match for {Path(args.take).name} in {args.sync_report}")
+        for r in report_rows:
+            header.append(f"{Path(r['video']).name}: take time = video time "
+                          f"{r['offset']:+.2f}s")
+
+    counts: dict[str, int] = {}
+    for s in segments:
+        counts[s.speaker] = counts.get(s.speaker, 0) + 1
+    header.append("Speakers: " + ", ".join(sorted(counts)))
+
+    (out_dir / f"{base}.txt").write_text(speakers_mod.to_text(segments, header), "utf-8")
+    (out_dir / f"{base}.srt").write_text(speakers_mod.to_srt(segments), "utf-8")
+    (out_dir / f"{base}.speakers.json").write_text(speakers_mod.to_json(segments), "utf-8")
+    for r in report_rows:
+        video = Path(r["video"])
+        srt = speakers_mod.to_srt(segments, shift=r["offset"],
+                                  duration=r.get("video_duration"))
+        (out_dir / f"{video.stem}.srt").write_text(srt, "utf-8")
+        _print(f"   srt       {video.stem}.srt (video time)")
+
+    _print("   " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
+    _print(f"-> {out_dir / base}.txt / .srt / .speakers.json")
     return 0
 
 
@@ -532,7 +597,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser(
         "sync", help="match camera videos to separately recorded audio takes, and mux them")
     p_sync.add_argument("--videos", nargs="+", required=True, metavar="PATH",
-                        help="camera files and/or directories of them")
+                        help="camera files and/or directories of them (audio "
+                             "extracted from the clips works too, for matching only)")
     p_sync.add_argument("--takes", nargs="+", required=True, metavar="PATH",
                         help="recorder audio files and/or directories of them")
     p_sync.add_argument("--out-dir", metavar="DIR",
@@ -551,6 +617,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--no-camera-fill", action="store_true",
                         help="leave uncovered stretches silent instead of using camera audio")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_spk = sub.add_parser(
+        "speakers", help="label a transcript by speaker from per-mic recorder tracks")
+    p_spk.add_argument("--transcript", required=True, metavar="JSON",
+                       help="whisper-cli -oj or openai-whisper JSON of the take")
+    p_spk.add_argument("--mic", action="append", required=True, metavar="NAME=PATH",
+                       help="one per mic track, e.g. Max=MIC1.WAV; a shared mic is "
+                            "David/Papa=MIC3.WAV (needs --anchor for each)")
+    p_spk.add_argument("--anchor", action="append", metavar="NAME=SECONDS",
+                       help="take time where NAME is clearly talking (shared mics only)")
+    p_spk.add_argument("--out-dir", required=True, metavar="DIR")
+    p_spk.add_argument("--name", help="output file base name (default: transcript stem)")
+    p_spk.add_argument("--title", help="first line of the .txt")
+    p_spk.add_argument("--take", metavar="PATH", help="the take the transcript is of")
+    p_spk.add_argument("--sync-report", metavar="JSON",
+                       help="sync --report output: also write one SRT per matched "
+                            "video, in that video's time (needs --take)")
+    p_spk.set_defaults(func=cmd_speakers)
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)

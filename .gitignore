@@ -17,3 +17,5 @@ contact-sheet*.jpg
 
 # macOS
 .DS_Store
+build/
+dist/
