@@ -709,12 +709,47 @@ class TestSpeakers(unittest.TestCase):
         # positive offset drops cues from before the video started
         self.assertNotIn("Hi.", speakers.to_srt(segs, shift=10.0))
 
-    def test_matches_for_take_by_stem(self):
-        report = [{"video": "/a/C0001.MP4", "take": "/x/2026_1108_1938.WAV", "offset": -6.5},
-                  {"video": "/a/C0002.MP4", "take": "/y/2026_1108_1938.wav", "offset": -5.2},
+    def test_matches_for_take_exact_then_unique_stem(self):
+        report = [{"video": "/a/C0001.MP4", "take": "/x/2026_1108_1938.wav", "offset": -6.5},
+                  {"video": "/b/C0199.MP4", "take": "/x/2026_1108_1938.wav", "offset": -5.2},
+                  {"video": "/a/C0002.MP4", "take": "/x/2026_1108_2010.wav", "offset": 13.2},
                   {"video": "/a/C0003.MP4", "take": None, "offset": None}]
-        got = speakers.matches_for_take(report, Path("/z/2026_1108_1938.WAV"))
-        self.assertEqual([Path(r["video"]).name for r in got], ["C0001.MP4", "C0002.MP4"])
+        names = lambda rows: [Path(r["video"]).name for r in rows]
+        self.assertEqual(names(speakers.matches_for_take(report, Path("/x/2026_1108_1938.wav"))),
+                         ["C0001.MP4", "C0199.MP4"])
+        # the original WAV, when sync ran on a resampled copy with the same stem
+        self.assertEqual(names(speakers.matches_for_take(report, Path("/sd/2026_1108_1938.WAV"))),
+                         ["C0001.MP4", "C0199.MP4"])
+
+    def test_matches_for_take_rejects_ambiguous_stem(self):
+        report = [{"video": "/a/C0001.MP4", "take": "/takeA/MIC1.WAV", "offset": -6.5},
+                  {"video": "/a/C0002.MP4", "take": "/takeB/MIC1.WAV", "offset": 40.0}]
+        # exact path still works
+        got = speakers.matches_for_take(report, Path("/takeB/MIC1.WAV"))
+        self.assertEqual([r["offset"] for r in got], [40.0])
+        with self.assertRaises(speakers.ToolError):
+            speakers.matches_for_take(report, Path("/elsewhere/MIC1.WAV"))
+
+    def test_camera_srt_names_never_collide(self):
+        self.assertEqual(speakers.camera_srt_names([Path("/m/C0199.MP4"), Path("/d/C0001.MP4")]),
+                         ["C0199", "C0001"])
+        self.assertEqual(
+            speakers.camera_srt_names([Path("/Max Cam/C0001.MP4"), Path("/David Cam/C0001.MP4")]),
+            ["Max Cam-C0001", "David Cam-C0001"])
+        # a camera named like the take transcript would overwrite it
+        self.assertEqual(speakers.camera_srt_names([Path("/cam/take.MP4")], reserved={"take"}),
+                         ["cam-take"])
+        with self.assertRaises(speakers.ToolError):
+            speakers.camera_srt_names([Path("/cam/C1.MP4"), Path("/cam/C1.mov")])
+
+    def test_seed_indices_rejects_anchors_on_one_segment(self):
+        mic = speakers.Mic(Path("MIC3.WAV"), ["David", "Papa"])
+        segs = [speakers.Segment(20.0, 27.0, "I'm David"), speakers.Segment(28.0, 33.0, "I'm Papa")]
+        self.assertEqual(speakers.seed_indices(segs, mic, {"David": 22.5, "Papa": 28.5}), [0, 1])
+        with self.assertRaises(speakers.ToolError):
+            speakers.seed_indices(segs, mic, {"David": 21.0, "Papa": 25.0})
+        with self.assertRaises(speakers.ToolError):    # nowhere near any speech
+            speakers.seed_indices(segs, mic, {"David": 22.5, "Papa": 400.0})
 
     @unittest.skipIf(sync._np is None, "numpy not installed")
     def test_anchored_kmeans_names_clusters_by_seed(self):

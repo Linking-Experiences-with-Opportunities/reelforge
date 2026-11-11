@@ -423,15 +423,19 @@ def cmd_speakers(args: argparse.Namespace) -> int:
         counts[s.speaker] = counts.get(s.speaker, 0) + 1
     header.append("Speakers: " + ", ".join(sorted(counts)))
 
+    # decide every output name before writing anything, so a collision can't
+    # leave one camera's subtitles silently overwritten by another's
+    srt_names = speakers_mod.camera_srt_names(
+        [Path(r["video"]) for r in report_rows], reserved={base})
+
     (out_dir / f"{base}.txt").write_text(speakers_mod.to_text(segments, header), "utf-8")
     (out_dir / f"{base}.srt").write_text(speakers_mod.to_srt(segments), "utf-8")
     (out_dir / f"{base}.speakers.json").write_text(speakers_mod.to_json(segments), "utf-8")
-    for r in report_rows:
-        video = Path(r["video"])
+    for r, name in zip(report_rows, srt_names):
         srt = speakers_mod.to_srt(segments, shift=r["offset"],
                                   duration=r.get("video_duration"))
-        (out_dir / f"{video.stem}.srt").write_text(srt, "utf-8")
-        _print(f"   srt       {video.stem}.srt (video time)")
+        (out_dir / f"{name}.srt").write_text(srt, "utf-8")
+        _print(f"   srt       {name}.srt (video time)")
 
     _print("   " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
     _print(f"-> {out_dir / base}.txt / .srt / .speakers.json")

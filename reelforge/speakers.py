@@ -173,6 +173,33 @@ def nearest_segment(segments: list[Segment], t: float) -> Segment | None:
                else min(abs(s.start - t), abs(s.end - t)), default=None)
 
 
+def seed_indices(embedded: list[Segment], mic: Mic,
+                 anchors: dict[str, float]) -> list[int]:
+    """Index into ``embedded`` of each name's anchor segment, in ``mic.names`` order.
+
+    Two anchors landing on the same segment would start both voices from one
+    example, and the names could come out swapped, so that is an error.
+    """
+    picked: dict[int, str] = {}
+    out = []
+    for name in mic.names:
+        t = anchors[name]
+        hit = nearest_segment(embedded, t)
+        if hit is None or not (hit.start - 5 <= t <= hit.end + 5):
+            raise ToolError(f"--anchor {name}={t}: no {mic.label} "
+                            "speech near that time (is it in take time?)")
+        j = embedded.index(hit)
+        if j in picked:
+            other = picked[j]
+            raise ToolError(
+                f"--anchor {other}={anchors[other]} and {name}={t} both land on "
+                f"the segment {hit.start:.1f}-{hit.end:.1f}s ({hit.text[:40]!r}); "
+                "pick, for each person, a moment where only they are talking")
+        picked[j] = name
+        out.append(j)
+    return out
+
+
 def split_shared(segments: list[Segment], mic: Mic,
                  anchors: dict[str, float], *, log=print) -> None:
     """Give each segment on a shared mic one of ``mic.names`` (in place)."""
@@ -203,13 +230,7 @@ def split_shared(segments: list[Segment], mic: Mic,
     if not embedded:
         raise ToolError(f"no {mic.label} segment is long enough to tell voices apart")
 
-    seeds = []
-    for name in mic.names:
-        hit = nearest_segment(embedded, anchors[name])
-        if hit is None or not (hit.start - 5 <= anchors[name] <= hit.end + 5):
-            raise ToolError(f"--anchor {name}={anchors[name]}: no {mic.label} "
-                            "speech near that time (is it in take time?)")
-        seeds.append(vectors[embedded.index(hit)])
+    seeds = [vectors[j] for j in seed_indices(embedded, mic, anchors)]
     for s, k in zip(embedded, anchored_kmeans(vectors, seeds)):
         s.speaker = mic.names[k]
     # too short to embed: same voice as the nearest earlier segment on this mic
@@ -294,8 +315,44 @@ def to_json(segments: list[Segment]) -> str:
 
 
 def matches_for_take(report: list[dict], take: Path) -> list[dict]:
-    """Rows of a ``sync --report`` whose take is this file (compared by stem)."""
+    """Rows of a ``sync --report`` whose take is this file.
+
+    An exact path match wins. Otherwise the file name stem is compared, which
+    lets you pass the original WAV when sync was run on a resampled copy, but
+    only if exactly one take in the report has that stem: ``takeA/MIC1.WAV``
+    and ``takeB/MIC1.WAV`` are different recordings and must not be mixed.
+    """
+    rows = [r for r in report if r.get("take") and r.get("offset") is not None]
+
+    def resolved(p) -> Path:
+        return Path(p).expanduser().resolve()
+
+    want = resolved(take)
+    exact = [r for r in rows if resolved(r["take"]) == want]
+    if exact:
+        return exact
     stem = take.stem.lower()
-    return [r for r in report
-            if r.get("take") and Path(r["take"]).stem.lower() == stem
-            and r.get("offset") is not None]
+    by_stem = [r for r in rows if Path(r["take"]).stem.lower() == stem]
+    distinct = sorted({str(resolved(r["take"])) for r in by_stem})
+    if len(distinct) > 1:
+        raise ToolError(f"{take.name} is ambiguous in the sync report: "
+                        + ", ".join(distinct) + ". Pass --take as the exact path "
+                        "the report uses.")
+    return by_stem
+
+
+def camera_srt_names(videos: list[Path], reserved: set[str] = frozenset()) -> list[str]:
+    """One distinct SRT base name per matched camera file.
+
+    Normally the video's stem (``C0001``). Two cameras that both number from
+    ``C0001`` get their folder prefixed (``Max Camera-C0001``) so neither
+    overwrites the other; a name that still collides is an error.
+    """
+    stems = [v.stem for v in videos]
+    names = [f"{v.parent.name}-{v.stem}" if stems.count(v.stem) > 1 or v.stem in reserved
+             else v.stem for v in videos]
+    clash = sorted({n for n in names if names.count(n) > 1 or n in reserved})
+    if clash:
+        raise ToolError("camera files would overwrite each other's subtitles: "
+                        + ", ".join(clash) + ". Rename one of them or pass a different --name.")
+    return names
