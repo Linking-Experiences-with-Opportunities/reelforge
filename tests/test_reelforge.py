@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -889,3 +890,117 @@ class TestServeHelper(unittest.TestCase):
 
     def test_pairing_must_come_from_a_page(self):
         self.assertEqual(self.call("POST", "/pair", origin=None, token=None)[0], 400)
+
+    # --- demo recorder ---------------------------------------------------- #
+
+    def _fake_claude(self, recording: Path, *, error=False):
+        """A stand-in for Claude Code that prints the stream it would."""
+        import stat
+        root = Path(self.tmp.name)
+        events = [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Writing the storyboard.\n"},
+                {"type": "tool_use", "name": "Bash", "input": {"description": "Record the flow"}}]}},
+            {"type": "result", "is_error": error,
+             "result": f"ENGINE: ffmpeg + format=walkthrough\nRECORDING: {recording} (1 MB, 20s, 1920x1080)\n"
+                       "FLOW: opens settings\nSAFETY: read-only flow\nDELIVERY: in the folder"},
+        ]
+        script = root / "claude"
+        lines = "\n".join(json.dumps(e) for e in events)
+        script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s' \"$2\" > '{root}/prompt.txt'\n"
+                          f"cat <<'JSON'\n{lines}\nJSON\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        return script
+
+    def _demo_ready(self, *, allow=True, error=False):
+        from reelforge import demo
+        root = Path(self.tmp.name)
+        recording = root / "Demos" / "features" / "settings-walkthrough.mp4"
+        recording.parent.mkdir(parents=True)
+        recording.write_bytes(b"mp4")
+        app = root / "app"
+        app.mkdir()
+        demo.save_config(self.helper.state_dir, {"dir": str(app)})
+        script = self._fake_claude(recording, error=error)
+        self.asked = []
+        self.helper.confirm_demo = lambda origin, request, folder: (self.asked.append((origin, request, folder)), allow)[1]
+        self.helper.demo_root = root / "Demos"
+        patch = mock.patch.object(demo, "find_claude", return_value=str(script))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return recording, app
+
+    def _wait(self, job_id):
+        import time as time_mod
+        for _ in range(100):
+            _, view, _ = self.call("GET", f"/jobs/{job_id}")
+            if view["status"] != "running":
+                return view
+            time_mod.sleep(0.05)
+        self.fail("the job never finished")
+
+    def test_demo_request_rules(self):
+        from reelforge import demo
+        ok = demo.demo_request({"feature": " profile\nsettings ", "url": "https://staging.example.dev/learn?x=1"})
+        self.assertEqual((ok["feature"], ok["url"], ok["format"], ok["local"]),
+                         ("profile settings", "https://staging.example.dev", "walkthrough", False))
+        self.assertTrue(demo.demo_request({"feature": "abc", "url": "http://localhost:7777"})["local"])
+        for bad in ({"feature": "ab", "url": "https://a.dev"},
+                    {"feature": "abc", "url": "http://a.dev"},
+                    {"feature": "abc", "url": "file:///etc/hosts"},
+                    {"feature": "abc", "url": "https://me:pw@a.dev"},
+                    {"feature": "abc", "url": "https://a.dev", "format": "gif"},
+                    {"feature": "x" * 301, "url": "https://a.dev"}):
+            with self.assertRaises(demo.DemoError):
+                demo.demo_request(bad)
+
+    def test_demo_prompt_names_the_site_and_forbids_posting(self):
+        from reelforge import demo
+        prompt = demo.demo_prompt(demo.demo_request(
+            {"feature": "profile settings", "url": "https://staging.example.dev", "format": "clip", "notes": "keep it short"}))
+        self.assertTrue(prompt.startswith("/record-demo profile settings format=clip\n"))
+        self.assertIn("Record against https://staging.example.dev", prompt)
+        self.assertIn("Do not post to a pull request", prompt)
+        self.assertIn("keep it short", prompt)
+        self.assertEqual(demo.command_of({"command": "/lilo:record-demo"}), "/lilo:record-demo")
+        self.assertEqual(demo.command_of({"command": "rm -rf /"}), "/record-demo")
+
+    def test_demo_runs_claude_in_the_chosen_folder_after_allow(self):
+        recording, app = self._demo_ready()
+        status, view, _ = self.call("POST", "/demo", {"feature": "profile settings", "url": "http://localhost:7777"})
+        self.assertEqual(status, 200, view)
+        done = self._wait(view["id"])
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["result"]["out"], str(recording))
+        self.assertEqual(done["result"]["report"][0], "ENGINE: ffmpeg + format=walkthrough")
+        self.assertEqual(done["log"], ["Writing the storyboard.", "· Bash: Record the flow"])
+        root = Path(self.tmp.name)
+        self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
+        self.assertTrue((root / "prompt.txt").read_text().startswith("/record-demo profile settings"))
+        self.assertEqual(self.asked[0][0], self.ORIGIN)
+        with mock.patch.object(self.serve.subprocess, "run") as run, \
+                mock.patch.object(self.serve.platform, "system", return_value="Darwin"):
+            self.assertEqual(self.call("POST", "/reveal", {"path": str(recording)})[0], 200)
+            run.assert_called_once()
+
+    def test_demo_needs_allow_setup_and_pairing(self):
+        self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"}, token=None)[0], 401)
+        self.helper.confirm_demo = lambda *a: self.fail("asked before setup")
+        with mock.patch("reelforge.demo.find_claude", return_value="/bin/echo"):
+            status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
+        self.assertEqual((status, body["error"]), (409, "choose the app folder first"))
+        self._demo_ready(allow=False)
+        self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})[0], 403)
+        self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "http://a.dev"})[0], 400)
+        self.assertEqual([j for j in self.helper.jobs.values() if j.kind == "demo"], [])
+
+    def test_demo_that_claude_reports_as_failed_is_failed(self):
+        self._demo_ready(error=True)
+        _, view, _ = self.call("POST", "/demo", {"feature": "abc def", "url": "https://a.dev"})
+        self.assertEqual(self._wait(view["id"])["status"], "failed")
+
+    def test_health_says_whether_demos_can_run(self):
+        _, body, _ = self.call("GET", "/health", token=None)
+        self.assertEqual(body["demo"]["dir"], None)
+        self.assertFalse(body["demo"]["ready"])

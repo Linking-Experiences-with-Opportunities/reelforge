@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reelforge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Study a short video's structure and rebuild it with your own footage; sync and label podcast multitrack."
 requires-python = ">=3.10"
 # Pillow is needed for captions, diagram detection and the contact sheet.
