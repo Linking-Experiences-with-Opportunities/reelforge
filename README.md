@@ -394,6 +394,7 @@ reelforge/
   render.py     recipe + media -> mp4
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   speakers.py   speaker labels from per-mic tracks, voice split for shared mics
+  serve.py      local helper a web page drives (loopback only, paired)
   cli.py        argparse front end
 tools/
   make_fixture.py   synthetic test reel generator
@@ -403,6 +404,36 @@ tests/
 
 Every command is a thin wrapper over a library function with JSON in and files
 out, so a web front end can sit on top of the same calls later.
+
+## Use it from a web page (no terminal)
+
+For teammates who should never see a command line. One paste, once (macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Linking-Experiences-with-Opportunities/reelforge/main/install.sh | bash
+```
+
+That installs Homebrew if it is missing, ffmpeg, yt-dlp, tesseract, whisper and
+reelforge, then starts `reelforge serve` and keeps it running across restarts
+(launchd agent `dev.pathion.reelforge-helper`, log in `~/.reelforge/helper.log`).
+The Tools tab on marketing.pathion.dev then drives it: study a reel, edit the
+words, pick footage with the normal macOS file window, make the video. Renders
+land in `~/Movies/Reelforge`. Footage never leaves the computer.
+
+`reelforge serve` listens on `127.0.0.1:47821` only, and answers:
+
+- only requests whose `Host` is that loopback address (no DNS rebinding);
+- only pages on its allow list (`--allow-origin`, default marketing.pathion.dev);
+- only with the pairing token, which a page gets after the person clicks
+  **Allow** in a dialog on their Mac (`/health` and `/pair` are the exceptions).
+
+Each job is the ordinary CLI run as a subprocess, so the page and the terminal
+behave the same. The helper pulls `main` each time it starts; the page's
+restart call (`POST /restart`) is how an update is picked up without a reboot.
+Windows is not built yet: the installer, the file windows and the start-at-login
+piece are macOS only.
+
+---
 
 ## Tests
 
