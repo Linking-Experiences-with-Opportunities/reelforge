@@ -435,6 +435,26 @@ piece are macOS only.
 
 ---
 
+### Demo recorder (Claude Code records a feature demo)
+
+The helper can also start a recording job that is not reelforge at all: `POST /demo` runs a
+`/record-demo` skill in [Claude Code](https://claude.com/claude-code) on this Mac (for example
+[record-demo-kit](https://github.com/maxMyers13/record-demo-kit)). The page sends what to show, the
+site's address and the format; Claude writes the storyboard, drives a browser and builds the video.
+
+That is Claude running on its own with full access to the Mac, so it is fenced differently from
+the rest:
+
+- every recording needs a click on **Allow** in a native window that shows what was asked, by
+  which site, and the folder Claude will work in (the default button is Don't Allow);
+- the page cannot choose the command or the folder. The folder is picked in a native dialog
+  (`POST /demo/folder`) and both live in `~/.reelforge/demo.json`:
+  `{"dir": "/path/to/app", "command": "/record-demo"}`;
+- only `https` sites, or `http` on localhost, and one recording at a time.
+
+`GET /health` reports `demo: {claude, dir, ready}`. The job's log is Claude's narration; its
+result carries the MP4 path from the skill's report.
+
 ## Tests
 
 ```bash

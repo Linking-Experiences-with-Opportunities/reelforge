@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
+from . import demo as demo_mod
 from . import recipe as recipe_mod
 from .render import IMAGE_SUFFIXES, VIDEO_SUFFIXES
 from .shell import have
@@ -182,7 +184,11 @@ def project_summary(folder: Path) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 class Job:
-    def __init__(self, kind: str, args: list[str], result: dict | None = None):
+    def __init__(self, kind: str, args: list[str], result: dict | None = None, *,
+                 argv: list[str] | None = None, cwd: Path | None = None, parse=None):
+        self.argv = argv  # a whole command instead of `python -m reelforge <args>`
+        self.cwd = cwd
+        self.parse = parse  # raw output line -> (lines to show, result fields)
         self.id = uuid.uuid4().hex[:12]
         self.kind = kind
         self.args = args
@@ -196,9 +202,11 @@ class Job:
     def start(self) -> None:
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "reelforge", *self.args],
+            self.argv or [sys.executable, "-m", "reelforge", *self.args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, env=env, text=True, errors="replace",
+            cwd=str(self.cwd) if self.cwd else None,
+            start_new_session=self.argv is not None,  # so cancel reaches what it started
         )
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -206,6 +214,12 @@ class Job:
         assert self.proc and self.proc.stdout
         for raw in self.proc.stdout:
             line = raw.rstrip("\n")
+            if self.parse:
+                shown, updates = self.parse(line)
+                with self.lock:
+                    self.log.extend(shown[: max(0, MAX_LOG_LINES - len(self.log))])
+                    self.result.update(updates)
+                continue
             with self.lock:
                 if len(self.log) < MAX_LOG_LINES:
                     self.log.append(line)
@@ -215,7 +229,7 @@ class Job:
         code = self.proc.wait()
         with self.lock:
             if self.status == "running":
-                self.status = "done" if code == 0 else "failed"
+                self.status = "done" if code == 0 and not self.result.pop("failed", False) else "failed"
             self.result["exit_code"] = code
 
     def cancel(self) -> None:
@@ -223,7 +237,12 @@ class Job:
             if self.status != "running":
                 return
             self.status = "cancelled"
-        if self.proc:
+        if self.proc and self.argv is not None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        elif self.proc:
             self.proc.terminate()
 
     def view(self, since: int = 0) -> dict:
@@ -298,6 +317,21 @@ def ask_to_pair(origin: str) -> bool:
     return code == 0 and out == "Allow"
 
 
+def ask_to_record(origin: str, request: dict, folder: Path) -> bool:
+    """Every demo recording starts Claude Code with full access, so the person approves each one."""
+    text = (f"Let Claude record a demo on this Mac?\n\nAsked by: {origin}\nShow: {request['feature']}\n"
+            f"On: {request['url']}\nWorking in: {folder}\n\n"
+            "Claude Code will run on its own, with full access to this Mac, until the video is made.")
+    script = (
+        "tell me to activate\n"
+        f"set answer to display dialog {_quote(text)} with title \"Demo recorder\" "
+        'buttons {"Don\'t Allow", "Allow"} default button "Don\'t Allow" giving up after 120\n'
+        "return button returned of answer"
+    )
+    code, out = _osascript(script, timeout=150)
+    return code == 0 and out == "Allow"
+
+
 # --------------------------------------------------------------------------- #
 # server
 # --------------------------------------------------------------------------- #
@@ -320,12 +354,17 @@ def load_token(state_dir: Path) -> str:
 class Helper:
     def __init__(self, projects: Path, *, port: int = DEFAULT_PORT,
                  origins: tuple[str, ...] = DEFAULT_ORIGINS, token: str | None = None,
-                 out_dir: Path = OUTPUT_DIR, state_dir: Path = STATE_DIR):
+                 out_dir: Path = OUTPUT_DIR, state_dir: Path = STATE_DIR,
+                 confirm_demo=ask_to_record, demo_root: Path = demo_mod.DEMO_ROOT):
         self.projects = projects
         self.port = port
         self.origins = tuple(origins)
         self.token = token or load_token(state_dir)
         self.out_dir = out_dir
+        self.state_dir = state_dir
+        self.confirm_demo = confirm_demo
+        self.demo_root = demo_root
+        self.demo_lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
         self.pair_lock = threading.Lock()
         self.server: ThreadingHTTPServer | None = None
@@ -338,6 +377,7 @@ class Helper:
             "ok": True, "version": __version__, "platform": platform.system(),
             "tools": tools, "ready": tools["ffmpeg"] and tools["ffprobe"],
             "projects_dir": str(self.projects), "output_dir": str(self.out_dir),
+            "demo": demo_mod.status(self.state_dir),
         }
 
     def list_projects(self) -> list[dict]:
@@ -377,15 +417,49 @@ class Helper:
         recipe_mod.save_recipe(data, path)
         return self.get_project(name)
 
-    def start_job(self, kind: str, args: list[str], result: dict | None = None) -> dict:
-        job = Job(kind, args, result)
+    def start_demo(self, body: dict, origin: str | None) -> dict:
+        try:
+            request = demo_mod.demo_request(body)
+        except demo_mod.DemoError as exc:
+            raise ApiError(400, str(exc)) from exc
+        config = demo_mod.load_config(self.state_dir)
+        claude, folder = demo_mod.find_claude(), demo_mod.folder_of(config)
+        if not claude:
+            raise ApiError(409, "Claude Code is not installed on this Mac")
+        if not folder:
+            raise ApiError(409, "choose the app folder first")
+        if not self.demo_lock.acquire(blocking=False):
+            raise ApiError(409, "a demo request is already waiting on this Mac")
+        try:
+            if any(j.kind == "demo" and j.status == "running" for j in self.jobs.values()):
+                raise ApiError(409, "a demo is already being recorded")
+            if not self.confirm_demo(origin or "this Mac", request, folder):
+                raise ApiError(403, "the recording was not allowed")
+            prompt = demo_mod.demo_prompt(request, demo_mod.command_of(config))
+            return self.start_job("demo", [], {"feature": request["feature"], "url": request["url"]},
+                                  argv=demo_mod.demo_argv(claude, prompt), cwd=folder,
+                                  parse=demo_mod.parse_line)
+        finally:
+            self.demo_lock.release()
+
+    def choose_demo_dir(self) -> dict:
+        """The folder Claude works in is picked in a native dialog, never sent by the page."""
+        picked = pick("folder", "Choose the app folder Claude should record from")
+        if picked:
+            config = demo_mod.load_config(self.state_dir)
+            config["dir"] = picked[0].rstrip("/")
+            demo_mod.save_config(self.state_dir, config)
+        return demo_mod.status(self.state_dir)
+
+    def start_job(self, kind: str, args: list[str], result: dict | None = None, **how) -> dict:
+        job = Job(kind, args, result, **how)
         self.jobs[job.id] = job
         job.start()
         return job.view()
 
     def reveal(self, body: dict, *, open_it: bool) -> dict:
         path = Path(str(body.get("path") or "")).expanduser().resolve()
-        allowed = (self.out_dir.resolve(), self.projects.resolve())
+        allowed = (self.out_dir.resolve(), self.projects.resolve(), self.demo_root.resolve())
         if not path.exists() or not any(root == path or root in path.parents for root in allowed):
             raise ApiError(400, "only files reelforge made can be opened from the page")
         if platform.system() != "Darwin":
@@ -437,6 +511,10 @@ class Helper:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             args, out = render_args(body, self.projects, self.out_dir, time.strftime("%Y%m%d-%H%M%S"))
             return self.start_job("render", args, {"out": str(out), "project": body.get("project")})
+        if method == "POST" and parts == ["demo"]:
+            return self.start_demo(body, origin)
+        if method == "POST" and parts == ["demo", "folder"]:
+            return self.choose_demo_dir()
         if len(parts) == 2 and parts[0] == "jobs" and method == "GET":
             job = self.jobs.get(parts[1])
             if not job:
