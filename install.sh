@@ -102,8 +102,17 @@ cat > "$PLIST" <<EOF
   <key>StandardErrorPath</key><string>$HOME_DIR/helper.log</string>
 </dict></plist>
 EOF
+# On a re-run the old helper takes a moment to stop; loading before it has gone fails.
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+for _ in $(seq 1 20); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
+for attempt in 1 2 3 4 5; do
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+  [ "$attempt" = 5 ] && fail "Could not start the helper. Restart the Mac and run this again."
+  sleep 2
+done
 
 say "Starting the helper"
 for _ in $(seq 1 30); do
