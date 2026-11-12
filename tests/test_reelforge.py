@@ -766,3 +766,126 @@ class TestSpeakers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestServeHelper(unittest.TestCase):
+    """The local helper a web page talks to: who may call it, and what it runs."""
+
+    ORIGIN = "https://marketing.pathion.dev"
+
+    def setUp(self):
+        import threading
+        from reelforge import serve
+        self.serve = serve
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.projects = root / "projects"
+        project = self.projects / "demo"
+        (project / "frames").mkdir(parents=True)
+        (project / "frames" / "frame-00001.jpg").write_bytes(b"\xff\xd8jpeg")
+        (root / "secret.jpg").write_bytes(b"nope")
+        recipe.save_recipe({"version": recipe.RECIPE_VERSION, "name": "demo",
+                            "target": {"duration": 3.0}, "segments": [
+                                {"index": 0, "role": "hook", "start": 0, "end": 3,
+                                 "duration": 3.0, "text": "hi", "fill": "clip"}]},
+                           project / "recipe.json")
+        self.helper = serve.Helper(self.projects, port=0, origins=(self.ORIGIN,),
+                                   token="tok", out_dir=root / "out", state_dir=root / "state")
+        self.server = self.helper.make_server()
+        self.helper.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def call(self, method, path, body=None, *, token="tok", origin=ORIGIN, host=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.helper.port, timeout=5)
+        headers = {"Host": host or f"127.0.0.1:{self.helper.port}"}
+        if origin:
+            headers["Origin"] = origin
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        data = json.dumps(body).encode() if body is not None else None
+        if data:
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=headers)
+        res = conn.getresponse()
+        raw = res.read()
+        conn.close()
+        kind = res.getheader("Content-Type") or ""
+        return res.status, (json.loads(raw) if "json" in kind and raw else raw), res
+
+    def test_health_needs_no_token_and_sets_cors(self):
+        status, body, res = self.call("GET", "/health", token=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["version"], self.serve.__version__)
+        self.assertEqual(res.getheader("Access-Control-Allow-Origin"), self.ORIGIN)
+
+    def test_other_sites_and_rebound_hosts_are_refused(self):
+        self.assertEqual(self.call("GET", "/health", origin="https://evil.example")[0], 403)
+        self.assertEqual(self.call("GET", "/projects", host="evil.example:80")[0], 403)
+        _, _, res = self.call("OPTIONS", "/projects", origin="https://evil.example", token=None)
+        self.assertIsNone(res.getheader("Access-Control-Allow-Origin"))
+
+    def test_preflight_allows_the_page(self):
+        status, _, res = self.call("OPTIONS", "/render", token=None)
+        self.assertEqual(status, 204)
+        self.assertEqual(res.getheader("Access-Control-Allow-Private-Network"), "true")
+
+    def test_token_is_required(self):
+        self.assertEqual(self.call("GET", "/projects", token=None)[0], 401)
+        self.assertEqual(self.call("GET", "/projects", token="wrong")[0], 401)
+        self.assertEqual(self.call("POST", "/render", {"project": "demo"}, token=None)[0], 401)
+
+    def test_projects_and_recipe_round_trip(self):
+        status, body, _ = self.call("GET", "/projects")
+        self.assertEqual([p["name"] for p in body["projects"]], ["demo"])
+        _, project, _ = self.call("GET", "/projects/demo")
+        project["recipe"]["segments"][0]["text"] = "edited"
+        status, saved, _ = self.call("PUT", "/projects/demo/recipe", {"recipe": project["recipe"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["recipe"]["segments"][0]["text"], "edited")
+        on_disk = recipe.load_recipe(self.projects / "demo" / "recipe.json")
+        self.assertEqual(on_disk["segments"][0]["text"], "edited")
+        before = recipe.load_recipe(self.projects / "demo" / "recipe.before-edit.json")
+        self.assertEqual(before["segments"][0]["text"], "hi")
+        self.assertEqual(self.call("PUT", "/projects/demo/recipe", {"recipe": {"x": 1}})[0], 400)
+
+    def test_project_files_cannot_escape_the_project(self):
+        self.assertEqual(self.call("GET", "/projects/demo/file/frames/frame-00001.jpg")[0], 200)
+        self.assertEqual(self.call("GET", "/projects/demo/file/..%2F..%2Fsecret.jpg")[0], 400)
+        self.assertEqual(self.call("GET", "/projects/demo/file/recipe.json")[0], 404)
+        self.assertEqual(self.call("GET", "/projects/..%2Fx")[0], 404)
+
+    def test_ingest_args(self):
+        args = self.serve.ingest_args(
+            {"source": "https://www.tiktok.com/@a/video/1", "browser": "Safari", "start": "0:10",
+             "duration": "45"}, self.projects)
+        self.assertEqual(args[:2], ["ingest", "https://www.tiktok.com/@a/video/1"])
+        self.assertIn("--cookies-from-browser", args)
+        self.assertEqual(args[args.index("--start") + 1], "0:10")
+        for bad in ({"source": ""}, {"source": "--out=/etc/x"}, {"source": "x", "browser": "lynx"},
+                    {"source": "x", "start": "1; rm"}, {"source": "x", "name": "../up"}):
+            with self.subTest(bad=bad), self.assertRaises(self.serve.ApiError):
+                self.serve.ingest_args(bad, self.projects)
+
+    def test_render_args(self):
+        args, out = self.serve.render_args(
+            {"project": "demo", "clips": ["/tmp/clips"], "music": "/tmp/a.mp3", "fit": "blur",
+             "audio_mode": "music", "captions": False}, self.projects, Path("/out"), "S")
+        self.assertEqual(out, Path("/out/demo-S.mp4"))
+        self.assertEqual(args[args.index("--clips") + 1], "/tmp/clips")
+        self.assertIn("--no-captions", args)
+        for bad in ({"project": "demo"}, {"project": "nope", "clips": ["/x"]},
+                    {"project": "demo", "clips": "/x"}, {"project": "demo", "clips": ["/x"], "fit": "zoom"}):
+            with self.subTest(bad=bad), self.assertRaises(self.serve.ApiError):
+                self.serve.render_args(bad, self.projects, Path("/out"), "S")
+
+    def test_only_reelforge_files_can_be_opened(self):
+        self.assertEqual(self.call("POST", "/open", {"path": "/etc/hosts"})[0], 400)
+
+    def test_pairing_must_come_from_a_page(self):
+        self.assertEqual(self.call("POST", "/pair", origin=None, token=None)[0], 400)

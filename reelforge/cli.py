@@ -12,6 +12,7 @@ from . import captions as captions_mod
 from . import ingest as ingest_mod
 from . import recipe as recipe_mod
 from . import render as render_mod
+from . import serve as serve_mod
 from . import sheet as sheet_mod
 from . import speakers as speakers_mod
 from . import sync as sync_mod
@@ -442,6 +443,10 @@ def cmd_speakers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    return serve_mod.serve(Path(args.projects).expanduser(), args.port, args.allow_origin)
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     checks = [
         ("ffmpeg", True, "brew install ffmpeg", "render + analyze"),
@@ -642,6 +647,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_serve = sub.add_parser(
+        "serve", help="run the local helper a web page uses to drive reelforge")
+    p_serve.add_argument("--projects", default=str(DEFAULT_PROJECTS),
+                         help=f"where projects are stored (default: {DEFAULT_PROJECTS})")
+    p_serve.add_argument("--port", type=int, default=serve_mod.DEFAULT_PORT,
+                         help=f"loopback port (default: {serve_mod.DEFAULT_PORT})")
+    p_serve.add_argument("--allow-origin", action="append", metavar="URL",
+                         help="page allowed to use the helper; repeatable "
+                              f"(default: {', '.join(serve_mod.DEFAULT_ORIGINS)})")
+    p_serve.set_defaults(func=cmd_serve)
 
     return parser
 
