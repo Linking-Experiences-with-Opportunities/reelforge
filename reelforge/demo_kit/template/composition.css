@@ -1,0 +1,29 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: var(--bg-page); }
+#root { position: relative; width: 100%; height: 100%; background: var(--bg-page); color: var(--text-primary); font-family: var(--font-sans); }
+.mono { font-family: var(--font-mono); letter-spacing: .14em; text-transform: uppercase; }
+.abs { position: absolute; }
+/* untimed crop wrapper: hides the 4px sync-flash strip at the bottom of every capture. MUST stay transparent: wrappers stack. */
+.crop { position: absolute; left: 60px; top: 90px; width: 1440px; height: 896px; overflow: hidden; border-radius: 14px; }
+#frame { left: 60px; top: 90px; width: 1440px; height: 896px; border-radius: 14px; border: 1px solid var(--border-default); pointer-events: none; }
+#hdr-l { left: 60px; top: 36px; font-size: 15px; color: var(--text-secondary); }
+#hdr-r { right: 60px; top: 24px; height: 30px; }
+#hdr-r img { height: 28px; width: auto; display: block; }
+#foot { left: 60px; top: 1024px; font-size: 13px; color: var(--text-secondary); }
+.pill { position: absolute; left: 1340px; top: 44px; padding: 7px 14px; border-radius: var(--radius-full); border: 1px solid var(--border-default); font-size: 13px; color: var(--text-primary); background: var(--bg-surface); opacity: 0; }
+#ticks { left: 1540px; top: 96px; width: 320px; height: 4px; display: flex; gap: 3px; }
+.tick { display: block; flex: 1; height: 4px; border-radius: 2px; background: var(--border-default); }
+.chap { position: absolute; left: 1540px; top: 132px; width: 320px; opacity: 0; }
+.cnt { font-size: 14px; color: var(--text-accent); margin-bottom: 16px; }
+.ct { font-size: 34px; line-height: 1.12; font-weight: 700; letter-spacing: -.025em; }
+.cs { margin-top: 18px; font-size: 19px; line-height: 1.45; color: var(--text-secondary); font-weight: 400; }
+.plabel { position: absolute; left: 1540px; top: 754px; font-size: 13px; color: var(--text-secondary); opacity: 0; }
+.pipcrop { position: absolute; left: 1540px; top: 786px; width: 320px; height: 198px; overflow: hidden; border-radius: var(--radius-lg); }
+#pipframe { left: 1540px; top: 786px; width: 320px; height: 198px; border-radius: var(--radius-lg); border: 1px solid var(--border-default); pointer-events: none; }
+.center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.center .logo { height: 46px; width: auto; margin-bottom: 44px; }
+.eyebrow { font-size: 20px; color: var(--text-accent); margin-bottom: 28px; }
+.big { font-size: 124px; font-weight: 800; letter-spacing: -.045em; line-height: 1; }
+.sub { margin-top: 30px; font-size: 32px; color: var(--text-secondary); font-weight: 400; max-width: 1200px; line-height: 1.35; }
+.chips { margin-top: 44px; display: flex; gap: 14px; }
+.chip { font-size: 20px; padding: 10px 20px; border: 1px solid var(--border-default); border-radius: var(--radius-full); color: var(--text-primary); }

@@ -1058,6 +1058,7 @@ class TestServeHelper(unittest.TestCase):
         script = root / "claude"
         lines = "\n".join(json.dumps(e) for e in events)
         script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s\\n' \"$@\" > '{root}/args.txt'\n"
+                          f"printf '%s\\n%s\\n' \"$DEMO_KIT_DIR\" \"$DEMO_BRAND_DIR\" > '{root}/env.txt'\n"
                           f"cat > '{root}/prompt.txt'\ncat <<'JSON'\n{lines}\nJSON\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return script
@@ -1177,12 +1178,54 @@ class TestServeHelper(unittest.TestCase):
         status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
         self.assertEqual((status, body["error"]), (409, "neither Claude Code nor Codex is installed on this Mac"))
         self._only_agents(claude="/bin/echo")
-        status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
+        from reelforge import demo
+        with mock.patch.object(demo, "kit_dir", return_value=None):  # an install without the kit inside it
+            status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
         self.assertEqual((status, body["error"]), (409, "choose the app folder first"))
         self._demo_ready(allow=False)
         self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})[0], 403)
         self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "http://a.dev"})[0], 400)
         self.assertEqual([j for j in self.helper.jobs.values() if j.kind == "demo"], [])
+
+    def test_demo_with_no_app_folder_uses_the_kit_inside_reelforge(self):
+        from reelforge import demo
+        recording, _ = self._demo_ready()
+        _, state, _ = self.call("POST", "/demo/builtin")  # forget the app folder
+        self.assertEqual((state["dir"], state["kit"], state["ready"]), (None, "builtin", True))
+        status, view, _ = self.call("POST", "/demo", {"feature": "the pricing page", "url": "https://pathion.dev",
+                                                      "format": "launch"})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self._wait(view["id"])["result"]["out"], str(recording))
+        root = Path(self.tmp.name)
+        work = self.helper.state_dir / demo.WORK_NAME
+        self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), work.resolve())
+        self.assertEqual(self.asked[0][2], work)  # the Allow window names the folder the agent works in
+        kit = demo.KIT_DIR
+        self.assertEqual((root / "env.txt").read_text().split("\n")[:2], [str(kit), str(kit / "brand")])
+        prompt = (root / "prompt.txt").read_text(encoding="utf-8")
+        # The skill arrives as text, so the agent needs no plugin, skill or repository.
+        self.assertTrue(prompt.startswith("Record a demo video of: the pricing page format=launch url=https://pathion.dev\n"))
+        self.assertNotIn("/record-demo the pricing page", prompt)
+        self.assertIn("## Report (exactly this shape, nothing more)", prompt)
+        self.assertIn("Record the following: the pricing page format=launch url=https://pathion.dev", prompt)
+        self.assertNotIn("$ARGUMENTS", prompt)
+        self.assertNotIn("argument-hint", prompt)  # the slash command's header is left out
+        self.assertIn(f"The demo kit is at {kit}", prompt)
+        self.assertIn("Do not post to a pull request", prompt)
+
+    def test_the_kit_inside_reelforge_is_whole_and_branded(self):
+        from reelforge import demo
+        kit = demo.kit_dir()
+        self.assertIsNotNone(kit)
+        brand = json.loads((kit / "brand" / "brand.json").read_text())
+        self.assertEqual(brand["name"], "Pathion")
+        for name in (brand["logo"]["dark"], brand["logo"]["light"], brand["mark"], "tokens.css", "fonts.css"):
+            self.assertTrue((kit / "brand" / name).is_file(), name)
+        for script in ("capture-kit.cjs", "detect-beats.mjs", "build-demo.mjs", "build-clip.mjs", "build-launch.mjs", "brand.mjs"):
+            self.assertTrue((kit / "scripts" / script).is_file(), script)
+        # A FORMAT line opens the kit's report; the page shows the report lines it knows.
+        self.assertEqual(demo._report_of("FORMAT: launch + polish=on\nFLOW: shows pricing")["report"],
+                         ["FORMAT: launch + polish=on", "FLOW: shows pricing"])
 
     def test_demo_that_claude_reports_as_failed_is_failed(self):
         self._demo_ready(error=True)
@@ -1272,8 +1315,14 @@ class TestServeHelper(unittest.TestCase):
 
     def test_health_says_whether_demos_can_run(self):
         _, body, _ = self.call("GET", "/health", token=None)
-        self.assertEqual(body["demo"]["dir"], None)
-        self.assertFalse(body["demo"]["ready"])
+        self.assertEqual((body["demo"]["dir"], body["demo"]["kit"]), (None, "builtin"))
+        from reelforge import demo
+        self._only_agents()
+        self.assertFalse(self.call("GET", "/health", token=None)[1]["demo"]["ready"])  # no agent to run it
+        self._only_agents(claude="/bin/echo")
+        self.assertTrue(self.call("GET", "/health", token=None)[1]["demo"]["ready"])  # the kit inside reelforge is enough
+        with mock.patch.object(demo, "kit_dir", return_value=None):
+            self.assertFalse(self.call("GET", "/health", token=None)[1]["demo"]["ready"])
 
 class TestNativeWindows(unittest.TestCase):
     """The Windows side of native.py, with PowerShell and taskkill mocked (these run on any OS)."""

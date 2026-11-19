@@ -49,6 +49,8 @@ say "Installing the video tools (ffmpeg, yt-dlp, tesseract)"
 for formula in ffmpeg yt-dlp tesseract git uv; do
   command -v "$formula" >/dev/null 2>&1 || brew install "$formula"
 done
+# Node runs the demo recorder's kit (the browser capture and the video build).
+command -v node >/dev/null 2>&1 || brew install node
 
 # ---- reelforge ------------------------------------------------------------
 if [ -z "${REELFORGE_SRC:-}" ]; then

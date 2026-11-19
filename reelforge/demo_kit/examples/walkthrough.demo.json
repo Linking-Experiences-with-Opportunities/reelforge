@@ -1,0 +1,34 @@
+{
+  "_note": "One seat, beat-cut chapters: the recommended shape for a single feature. Pairs with walkthrough-capture.example.cjs.",
+  "feature": "team-invites",
+  "header": "Team invites · Walkthrough",
+  "footnote": "Recorded locally with a demo account",
+  "intro": {
+    "eyebrow": "New · Team invites",
+    "title": "Invite your team",
+    "subtitle": "Send an invite, pick a role, and see who has joined."
+  },
+  "outro": {
+    "eyebrow": "Shipped · PR #123",
+    "title": "Bring them in.",
+    "chips": ["Email invites", "Roles", "Pending list"]
+  },
+  "seats": { "main": { "video": "raw/main.mp4" } },
+  "chapters": [
+    {
+      "title": "Open team settings",
+      "sub": "Everyone on the workspace is listed with their role.",
+      "segments": [{ "from": "settings", "to": "invite" }]
+    },
+    {
+      "title": "Send an invite",
+      "sub": "Type an email, pick a role and send.",
+      "segments": [{ "from": "invite", "to": "pending", "rate": 1.25 }]
+    },
+    {
+      "title": "Track who joined",
+      "sub": "The invite shows as pending until they accept.",
+      "segments": [{ "from": "pending", "dur": 3.4 }]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "_note": "Two seats recorded at once (s.seat() twice). The acting seat plays large; the other plays as a picture-in-picture, time-mapped through both seats' beats. `file` plays a standalone clip; `pip` overrides the automatic picture-in-picture.",
+  "feature": "shared-doc",
+  "header": "Shared docs · Walkthrough",
+  "intro": { "eyebrow": "New · Live collaboration", "title": "Edit together", "subtitle": "Two people, one document, changes as they type." },
+  "outro": { "eyebrow": "Shipped · PR #456", "title": "Write it together.", "chips": ["Live cursors", "Presence", "Comments"] },
+  "seats": {
+    "owner": { "label": "Owner", "video": "raw/owner.mp4" },
+    "guest": { "label": "Guest", "video": "raw/guest.mp4" }
+  },
+  "chapters": [
+    { "title": "Share a link", "sub": "The owner copies an invite link from the share menu.", "segments": [{ "seat": "owner", "from": "share", "to": "joined" }] },
+    { "title": "Guest joins", "sub": "Presence chips show who is in the document.", "segments": [{ "seat": "guest", "from": "join", "dur": 4.4 }, { "seat": "owner", "from": "joined", "to": "typing" }] },
+    { "title": "Type together", "sub": "Edits and cursors appear for both people as they type.", "segments": [{ "seat": "guest", "from": "typing", "dur": 9, "rate": 1.4 }] },
+    { "title": "Leave a comment", "sub": "Select text and comment; the other seat sees it right away.", "segments": [{ "seat": "owner", "from": "comment", "dur": 6, "pip": { "seat": "guest", "at": "seen" } }] }
+  ]
+}
