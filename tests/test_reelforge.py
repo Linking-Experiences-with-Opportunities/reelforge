@@ -765,6 +765,26 @@ class TestSpeakers(unittest.TestCase):
         self.assertEqual(labels[20:], [0] * 8)
 
 
+
+class TestReviewFixes(unittest.TestCase):
+    def test_split_turns_cuts_at_sentences_and_pauses(self):
+        from reelforge.cli import split_turns
+        w = lambda t, a, b: {"word": t, "start": a, "end": b}
+        seg = {"start": 0, "end": 5, "text": "x", "words": [
+            w(" How", 0, .3), w(" was", .3, .5), w(" it?", .5, .8),
+            w(" Great", 1.0, 1.3), w(" really", 1.3, 1.6), w(" and", 2.6, 2.8), w(" fun", 2.8, 3.0)]}
+        got = split_turns([seg, {"start": 9, "end": 10, "text": "no words"}])
+        self.assertEqual([g["text"] for g in got], ["How was it?", "Great really", "and fun", "no words"])
+        self.assertEqual((got[1]["start"], got[1]["end"]), (1.0, 1.6))
+
+    def test_fresh_dir_never_reuses_a_folder(self):
+        import tempfile
+        from reelforge.serve import fresh_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = fresh_dir(Path(tmp) / "Sync", "s"), fresh_dir(Path(tmp) / "Sync", "s")
+            self.assertEqual((a.name, b.name), ("s", "s-2"))
+            self.assertTrue(a.is_dir() and b.is_dir())
+
 if __name__ == "__main__":
     unittest.main()
 

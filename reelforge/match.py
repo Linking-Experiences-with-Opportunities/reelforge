@@ -123,13 +123,15 @@ def measure(clip: Clip) -> Stats:
 
     -ss goes BEFORE -i. Input seeking is instant; output seeking decodes the
     whole file first, which turns a minute of work into a quarter of an hour.
+    Frames are measured as 8-bit: signalstats reports at the input's bit depth,
+    so a 10-bit camera would otherwise be compared on a 0-1023 scale.
     """
     require("ffmpeg")
     samples: list[Stats] = []
     window = min(SAMPLE_SECONDS, clip.duration) if clip.duration else SAMPLE_SECONDS
     for point in SAMPLE_POINTS:
         start = max(0.0, clip.duration * point - window / 2) if clip.duration else 0.0
-        vf = ",".join(p for p in (clip.base_vf(), "signalstats", "metadata=print:file=-") if p)
+        vf = ",".join(p for p in (clip.base_vf(), "format=yuv420p", "signalstats", "metadata=print:file=-") if p)
         proc = run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", *clip.pre(),
                     "-ss", f"{start:.2f}", "-t", f"{window:.2f}", "-i", str(clip.path),
                     "-vf", vf, "-an", "-f", "null", "-"], check=False)

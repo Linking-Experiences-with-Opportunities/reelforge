@@ -436,6 +436,20 @@ def load_token(state_dir: Path) -> str:
     return token
 
 
+def fresh_dir(parent: Path, stamp: str) -> Path:
+    """A new folder for one job. Two jobs started in the same second each get
+    their own (stamp, stamp-2, ...), so neither overwrites the other's files."""
+    parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        out = parent / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            out.mkdir()
+            return out
+        except FileExistsError:
+            n += 1
+
+
 class Helper:
     def __init__(self, projects: Path, *, port: int = DEFAULT_PORT,
                  origins: tuple[str, ...] = DEFAULT_ORIGINS, token: str | None = None,
@@ -601,9 +615,9 @@ class Helper:
             kind = parts[0]
             build = {"sync": sync_args, "speakers": speakers_args, "match": match_args}[kind]
             folder = {"sync": "Podcast sync", "speakers": "Speaker labels", "match": "Camera matching"}[kind]
-            out = self.out_dir / folder / time.strftime("%Y%m%d-%H%M%S")
+            build(body, self.out_dir / folder)  # a bad request stops here, before any folder is made
+            out = fresh_dir(self.out_dir / folder, time.strftime("%Y%m%d-%H%M%S"))
             args = build(body, out)
-            out.mkdir(parents=True, exist_ok=True)
             return self.start_job(kind, args, {"out_dir": str(out)})
         if method == "POST" and parts == ["demo"]:
             return self.start_demo(body, origin)

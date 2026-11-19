@@ -402,13 +402,44 @@ def _transcribe_take(take: Path, out_dir: Path, model: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     _print(f"-> transcribing {take.name} (whisper {model}); a long take needs a while")
     proc = run(["whisper", str(take), "--model", model, "--output_format", "json",
-                "--output_dir", str(out_dir), "--verbose", "False", "--fp16", "False"],
+                "--output_dir", str(out_dir), "--verbose", "False", "--fp16", "False",
+                "--word_timestamps", "True"],
                check=False)
     written = out_dir / f"{take.stem}.json"
     if proc.returncode != 0 or not written.is_file():
         tail = (proc.stderr or b"").decode("utf-8", "replace").strip()[-400:]
         raise ToolError(f"whisper could not transcribe {take.name}: {tail}")
+    data = json.loads(written.read_text(encoding="utf-8"))
+    data["segments"] = split_turns(data.get("segments") or [])
+    written.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return written
+
+
+def split_turns(segments: list[dict], max_words: int = 14, gap: float = 0.6) -> list[dict]:
+    """Cut whisper's segments into short ones, using its word timings.
+
+    A whole segment gets one speaker label, and whisper happily puts a question
+    and the other person's answer in the same segment. Cutting at the end of a
+    sentence, at a pause, or after `max_words` keeps each piece to one voice.
+    A segment without word timings is kept as it is.
+    """
+    out: list[dict] = []
+    for seg in segments:
+        words = [w for w in (seg.get("words") or []) if "start" in w and "end" in w]
+        if not words:
+            out.append(seg)
+            continue
+        piece: list[dict] = []
+        for i, word in enumerate(words):
+            piece.append(word)
+            nxt = words[i + 1] if i + 1 < len(words) else None
+            ends = str(word.get("word", "")).rstrip().endswith((".", "?", "!"))
+            pause = nxt is not None and nxt["start"] - word["end"] >= gap
+            if nxt is None or ends or pause or len(piece) >= max_words:
+                out.append({"start": piece[0]["start"], "end": piece[-1]["end"],
+                            "text": "".join(str(w.get("word", "")) for w in piece).strip()})
+                piece = []
+    return out
 
 
 def cmd_match(args: argparse.Namespace) -> int:
