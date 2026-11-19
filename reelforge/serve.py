@@ -261,6 +261,9 @@ def project_summary(folder: Path) -> dict | None:
 # jobs
 # --------------------------------------------------------------------------- #
 
+CODEX_LOGIN_GRACE = 2.0  # seconds a sign-in must survive before the page is told it opened
+
+
 class Job:
     def __init__(self, kind: str, args: list[str], result: dict | None = None, *,
                  argv: list[str] | None = None, cwd: Path | None = None, parse=None):
@@ -465,6 +468,7 @@ class Helper:
         self.demo_root = demo_root
         self.demo_lock = threading.Lock()
         self.codex_login_proc: subprocess.Popen | None = None
+        self.setup_lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
         self.pair_lock = threading.Lock()
         self.server: ThreadingHTTPServer | None = None
@@ -555,9 +559,7 @@ class Helper:
         agent = body.get("agent")
         if agent not in demo_mod.find_agents():
             raise ApiError(400, "that is not installed on this Mac")
-        config = demo_mod.load_config(self.state_dir)
-        config["agent"] = agent
-        demo_mod.save_config(self.state_dir, config)
+        demo_mod.change_config(self.state_dir, agent=agent)
         return demo_mod.status(self.state_dir)
 
     def install_codex(self) -> dict:
@@ -567,29 +569,37 @@ class Helper:
         argv = demo_mod.codex_install_argv()
         if not argv:
             raise ApiError(409, "Homebrew is not on this Mac, so Codex has to be installed by hand")
-        if any(j.kind == "codex-install" and j.status == "running" for j in self.jobs.values()):
-            raise ApiError(409, "Codex is already being installed")
-        return self.start_job("codex-install", [], {}, argv=argv)
+        # Checked and started under one lock, so a double click cannot start Homebrew twice.
+        with self.setup_lock:
+            if any(j.kind == "codex-install" and j.status == "running" for j in self.jobs.values()):
+                raise ApiError(409, "Codex is already being installed")
+            return self.start_job("codex-install", [], {}, argv=argv)
 
     def codex_login(self) -> dict:
         """Opens Codex's own sign-in page in the browser. The person signs in there; nothing passes through the page."""
         codex = demo_mod.find_codex()
         if not codex:
             raise ApiError(409, "Codex is not installed on this Mac")
-        with self.demo_lock:
+        with self.setup_lock:
             if self.codex_login_proc and self.codex_login_proc.poll() is None:
                 self.codex_login_proc.terminate()
-            self.codex_login_proc = subprocess.Popen(
+            proc = self.codex_login_proc = subprocess.Popen(
                 [codex, "login"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A sign-in that works keeps running until the browser comes back. One that stops
+        # straight away failed; its output is not read, since it can carry sign-in links.
+        try:
+            code = proc.wait(timeout=CODEX_LOGIN_GRACE)
+        except subprocess.TimeoutExpired:
+            return {"ok": True}
+        if code != 0:
+            raise ApiError(502, "Codex could not open its sign-in page. Open Terminal, type codex login, and press Return.")
         return {"ok": True}
 
     def choose_demo_dir(self) -> dict:
         """The folder the agent works in is picked in a native dialog, never sent by the page."""
         picked = pick("folder", "Choose the app folder to record from")
         if picked:
-            config = demo_mod.load_config(self.state_dir)
-            config["dir"] = picked[0].rstrip("/")
-            demo_mod.save_config(self.state_dir, config)
+            demo_mod.change_config(self.state_dir, dir=picked[0].rstrip("/"))
         return demo_mod.status(self.state_dir)
 
     def start_job(self, kind: str, args: list[str], result: dict | None = None, **how) -> dict:

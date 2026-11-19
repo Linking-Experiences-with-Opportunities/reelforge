@@ -1211,8 +1211,14 @@ class TestServeHelper(unittest.TestCase):
         self.assertEqual((status, body["error"], self.asked), (409, "sign in to Codex first", []))
         self.assertEqual(self.call("POST", "/demo/codex-login", {}, token=None)[0], 401)
         with mock.patch.object(self.serve.subprocess, "Popen") as popen:
+            popen.return_value.wait.side_effect = self.serve.subprocess.TimeoutExpired("codex", 2)
             self.assertEqual(self.call("POST", "/demo/codex-login", {})[0], 200)
             self.assertEqual(popen.call_args[0][0][1:], ["login"])
+            popen.return_value.wait.side_effect = None
+            popen.return_value.wait.return_value = 1
+            status, body, _ = self.call("POST", "/demo/codex-login", {})
+            self.assertEqual(status, 502)
+            self.assertIn("codex login", body["error"])
         self._only_agents(claude="/bin/echo")
         self.assertEqual(self.call("POST", "/demo/codex-login", {})[0], 409)
 
@@ -1250,6 +1256,9 @@ class TestServeHelper(unittest.TestCase):
         self._only_agents(claude="/bin/echo")
         self.assertEqual(self.call("POST", "/demo/agent", {"agent": "codex"})[0], 400)
         self.assertEqual(demo.status(self.helper.state_dir)["agent"], "claude")
+        demo.change_config(self.helper.state_dir, dir="/somewhere")
+        self.assertEqual(demo.load_config(self.helper.state_dir)["agent"], "codex")
+        self.assertFalse((self.helper.state_dir / "demo.json.new").exists())
         self.assertEqual(demo.codex_command_of({"codex_command": "$my-skill"}), "$my-skill")
         self.assertEqual(demo.codex_command_of({"codex_command": "; rm -rf /"}), "$lilo-record-demo")
 

@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -118,8 +119,22 @@ def load_config(state_dir: Path) -> dict:
 
 
 def save_config(state_dir: Path, config: dict) -> None:
+    """Written beside the file and moved into place, so a reader never sees half a file."""
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / CONFIG_NAME).write_text(json.dumps(config, indent=2) + "\n", "utf-8")
+    fresh = state_dir / (CONFIG_NAME + ".new")
+    fresh.write_text(json.dumps(config, indent=2) + "\n", "utf-8")
+    os.replace(fresh, state_dir / CONFIG_NAME)
+
+
+_CONFIG_LOCK = threading.Lock()
+
+
+def change_config(state_dir: Path, **changes) -> None:
+    """Read, change and save the settings as one step, so two changes at once cannot undo each other."""
+    with _CONFIG_LOCK:
+        config = load_config(state_dir)
+        config.update(changes)
+        save_config(state_dir, config)
 
 
 def command_of(config: dict) -> str:
