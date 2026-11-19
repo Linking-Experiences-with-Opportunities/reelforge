@@ -1149,7 +1149,7 @@ class TestServeHelper(unittest.TestCase):
     def test_demo_runs_claude_in_the_chosen_folder_after_allow(self):
         recording, app = self._demo_ready()
         status, view, _ = self.call("POST", "/demo", {"feature": "profile settings", "url": "http://localhost:7777",
-                                                      "notes": "a & b | <c> \"d\"\nsecond line"})
+                                                      "notes": "a & b | <c> \"d\"\nsecond line café 中文 🎬"})
         self.assertEqual(status, 200, view)
         done = self._wait(view["id"])
         self.assertEqual(done["status"], "done")
@@ -1158,12 +1158,12 @@ class TestServeHelper(unittest.TestCase):
         self.assertEqual(done["log"], ["Writing the storyboard.", "· Bash: Record the flow"])
         root = Path(self.tmp.name)
         self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
-        prompt = (root / "prompt.txt").read_text()
+        prompt = (root / "prompt.txt").read_text(encoding="utf-8")
         self.assertTrue(prompt.startswith("/record-demo profile settings"))
         # The prompt arrives on stdin, never as an argument (cmd.exe would parse it on Windows).
         self.assertNotIn("profile settings", (root / "args.txt").read_text())
         self.assertIn("Notes from the person", prompt)
-        self.assertIn("a & b | <c> \"d\"\nsecond line", prompt)
+        self.assertIn("a & b | <c> \"d\"\nsecond line café 中文 🎬", prompt)
         self.assertEqual((self.asked[0][0], self.asked[0][3]), (self.ORIGIN, "Claude Code"))
         from reelforge import native
         with mock.patch.object(native.subprocess, "run") as run, mock.patch.object(native, "IS_MAC", True):
@@ -1284,6 +1284,25 @@ class TestNativeWindows(unittest.TestCase):
         patcher = mock.patch.multiple(native, IS_MAC=False, IS_WINDOWS=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_picked_folder_keeps_a_drive_root(self):
+        clean = self.native.clean_folder
+        self.assertEqual(clean("C:\\"), "C:\\")  # "C:" alone is the current folder on C
+        self.assertEqual(clean("D:/"), "D:\\")
+        self.assertEqual(clean("C:\\Users\\zay\\app\\"), "C:\\Users\\zay\\app")
+        self.assertEqual(clean("/Users/max/app/"), "/Users/max/app")
+        self.assertEqual(clean("/"), "/")
+
+    def test_agent_prompt_goes_in_as_utf8(self):
+        # Windows' default code page would turn non-English notes into "?".
+        from reelforge import serve
+        job = serve.Job("demo", [], {}, argv=["agent"], stdin_text="café 中文 🎬")
+        with mock.patch.object(serve.subprocess, "Popen") as popen, \
+                mock.patch.object(serve.threading, "Thread"):
+            job.start()
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertEqual(kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
     def _ran(self, stdout: str, code: int = 0):
         return mock.patch.object(self.native.subprocess, "run", return_value=mock.Mock(
