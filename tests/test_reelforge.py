@@ -785,6 +785,7 @@ class TestReviewFixes(unittest.TestCase):
             self.assertEqual((a.name, b.name), ("s", "s-2"))
             self.assertTrue(a.is_dir() and b.is_dir())
 
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1056,8 +1057,8 @@ class TestServeHelper(unittest.TestCase):
         ]
         script = root / "claude"
         lines = "\n".join(json.dumps(e) for e in events)
-        script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s' \"$2\" > '{root}/prompt.txt'\n"
-                          f"cat <<'JSON'\n{lines}\nJSON\n")
+        script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s\\n' \"$@\" > '{root}/args.txt'\n"
+                          f"cat > '{root}/prompt.txt'\ncat <<'JSON'\n{lines}\nJSON\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return script
 
@@ -1078,7 +1079,7 @@ class TestServeHelper(unittest.TestCase):
         script = root / "codex"
         lines = "\n".join(json.dumps(e) for e in events)
         script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s\\n' \"$@\" > '{root}/args.txt'\n"
-                          f"cat <<'JSON'\n{lines}\nJSON\n")
+                          f"cat > '{root}/prompt.txt'\ncat <<'JSON'\n{lines}\nJSON\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return script
 
@@ -1147,7 +1148,8 @@ class TestServeHelper(unittest.TestCase):
 
     def test_demo_runs_claude_in_the_chosen_folder_after_allow(self):
         recording, app = self._demo_ready()
-        status, view, _ = self.call("POST", "/demo", {"feature": "profile settings", "url": "http://localhost:7777"})
+        status, view, _ = self.call("POST", "/demo", {"feature": "profile settings", "url": "http://localhost:7777",
+                                                      "notes": "a & b | <c> \"d\"\nsecond line"})
         self.assertEqual(status, 200, view)
         done = self._wait(view["id"])
         self.assertEqual(done["status"], "done")
@@ -1156,12 +1158,17 @@ class TestServeHelper(unittest.TestCase):
         self.assertEqual(done["log"], ["Writing the storyboard.", "· Bash: Record the flow"])
         root = Path(self.tmp.name)
         self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
-        self.assertTrue((root / "prompt.txt").read_text().startswith("/record-demo profile settings"))
+        prompt = (root / "prompt.txt").read_text()
+        self.assertTrue(prompt.startswith("/record-demo profile settings"))
+        # The prompt arrives on stdin, never as an argument (cmd.exe would parse it on Windows).
+        self.assertNotIn("profile settings", (root / "args.txt").read_text())
+        self.assertIn("Notes from the person", prompt)
+        self.assertIn("a & b | <c> \"d\"\nsecond line", prompt)
         self.assertEqual((self.asked[0][0], self.asked[0][3]), (self.ORIGIN, "Claude Code"))
-        with mock.patch.object(self.serve.subprocess, "run") as run, \
-                mock.patch.object(self.serve.platform, "system", return_value="Darwin"):
+        from reelforge import native
+        with mock.patch.object(native.subprocess, "run") as run, mock.patch.object(native, "IS_MAC", True):
             self.assertEqual(self.call("POST", "/reveal", {"path": str(recording)})[0], 200)
-            run.assert_called_once()
+            self.assertEqual(run.call_args[0][0], ["open", "-R", str(recording.resolve())])
 
     def test_demo_needs_allow_setup_and_pairing(self):
         self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"}, token=None)[0], 401)
@@ -1198,7 +1205,8 @@ class TestServeHelper(unittest.TestCase):
         root = Path(self.tmp.name)
         args = (root / "args.txt").read_text().splitlines()
         self.assertEqual(args[:4], ["exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"])
-        self.assertEqual(args[4], "$lilo-record-demo profile settings format=walkthrough")
+        self.assertEqual(args[4:], ["-"])  # the prompt comes on stdin
+        self.assertTrue((root / "prompt.txt").read_text().startswith("$lilo-record-demo profile settings format=walkthrough\n"))
         self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
         self.assertEqual(self.asked[0][3], "Codex")
 
@@ -1266,3 +1274,76 @@ class TestServeHelper(unittest.TestCase):
         _, body, _ = self.call("GET", "/health", token=None)
         self.assertEqual(body["demo"]["dir"], None)
         self.assertFalse(body["demo"]["ready"])
+
+class TestNativeWindows(unittest.TestCase):
+    """The Windows side of native.py, with PowerShell and taskkill mocked (these run on any OS)."""
+
+    def setUp(self):
+        from reelforge import native
+        self.native = native
+        patcher = mock.patch.multiple(native, IS_MAC=False, IS_WINDOWS=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ran(self, stdout: str, code: int = 0):
+        return mock.patch.object(self.native.subprocess, "run", return_value=mock.Mock(
+            returncode=code, stdout=stdout.encode("utf-8")))
+
+    def test_page_text_never_becomes_script_source(self):
+        import base64
+        sneaky = "x'; Remove-Item C:\\ -Recurse; '$(whoami)"
+        with self._ran("Allow\r\n") as run:
+            self.assertTrue(self.native.confirm("Demo recorder", sneaky, default_allow=False))
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(argv[0], "powershell.exe")
+        script = base64.b64decode(argv[-1]).decode("utf-16-le")
+        self.assertNotIn("Remove-Item", script)
+        self.assertEqual(kwargs["env"]["RF_TEXT"], sneaky)
+        self.assertEqual(kwargs["env"]["RF_DEFAULT_ALLOW"], "0")
+
+    def test_confirm_is_no_unless_allow_was_clicked(self):
+        for out, code in (("Deny", 0), ("", 1), ("Allow", 1)):
+            with self.subTest(out=out, code=code), self._ran(out, code):
+                self.assertFalse(self.native.confirm("t", "x", default_allow=True))
+        with mock.patch.object(self.native.subprocess, "run",
+                               side_effect=self.native.subprocess.TimeoutExpired("powershell", 1)):
+            self.assertFalse(self.native.confirm("t", "x", default_allow=True))
+
+    def test_pickers_return_windows_paths(self):
+        with self._ran("C:\\Users\\z\\a.mp4\r\nC:\\Users\\z\\b b.mov\r\n") as run:
+            picked = self.native.pick({".mp4", ".mov"}, True, "Choose clips")
+        self.assertEqual(picked, ["C:\\Users\\z\\a.mp4", "C:\\Users\\z\\b b.mov"])
+        env = run.call_args[1]["env"]
+        self.assertEqual((env["RF_FOLDER"], env["RF_MULTIPLE"], env["RF_FILTER"]),
+                         ("0", "1", "Supported files|*.mov;*.mp4|All files|*.*"))
+        with self._ran("", 0) as run:
+            self.assertEqual(self.native.pick(None, False, "Choose the app folder"), [])
+        self.assertEqual(run.call_args[1]["env"]["RF_FOLDER"], "1")
+
+    def test_cancel_stops_the_whole_tree(self):
+        with mock.patch.object(self.native.subprocess, "run") as run:
+            self.native.kill_tree(mock.Mock(pid=4242))
+        self.assertEqual(run.call_args[0][0], ["taskkill", "/PID", "4242", "/T", "/F"])
+        self.assertIn("creationflags", self.native.group_kwargs())
+
+    def test_reveal_selects_the_file_in_explorer(self):
+        with mock.patch.object(self.native.subprocess, "run") as run:
+            self.native.reveal(Path("C:/Users/z/Videos/Reelforge/a.mp4"), open_it=False)
+        self.assertTrue(run.call_args[0][0].startswith('explorer.exe /select,"'))
+
+    def test_codex_installs_with_npm_and_powershell_wrappers_are_unwrapped(self):
+        from reelforge import demo
+        with mock.patch.object(demo.native, "IS_WINDOWS", True), \
+                mock.patch.object(demo, "_find", return_value="C:\\Program Files\\nodejs\\npm.cmd"):
+            self.assertEqual(demo.codex_install_argv(),
+                             ["C:\\Program Files\\nodejs\\npm.cmd", "install", "--global", "@openai/codex"])
+        line = json.dumps({"type": "item.started", "item": {"type": "command_execution", "command":
+                           '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'npx playwright test\''}})
+        self.assertEqual(demo.parse_codex_line(line)[0], ["· Shell: npx playwright test"])
+
+    def test_unsupported_systems_say_so(self):
+        with mock.patch.multiple(self.native, IS_MAC=False, IS_WINDOWS=False):
+            with self.assertRaises(self.native.NativeError):
+                self.native.pick(None, False, "x")
+            with self.assertRaises(self.native.NativeError):
+                self.native.confirm("t", "x", default_allow=True)
