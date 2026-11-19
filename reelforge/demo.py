@@ -1,16 +1,20 @@
-"""Demo recorder: the page asks Claude Code on this Mac to record a feature demo.
+"""Demo recorder: the page asks a coding agent on this Mac to record a feature demo.
 
 Unlike a reelforge job, this one is not a fixed command. It starts Claude Code
-with a `/record-demo` skill, and Claude writes the storyboard, drives a browser
-and builds the video. That is far more power than picking files, so:
+or Codex with the app's record-demo skill, and the agent writes the storyboard,
+drives a browser and builds the video. That is far more power than picking
+files, so:
 
   * the person must click Allow in a native dialog for EVERY recording, and the
     dialog shows exactly what was asked for;
   * only one recording runs at a time;
   * the page can only choose what to show, where, and in which format. The
-    command and the folder Claude works in are set on this Mac, not by the page.
+    command and the folder the agent works in are set on this Mac, not by the page.
 
-Setup lives in ~/.reelforge/demo.json: {"dir": "<app folder>", "command": "/record-demo"}.
+Setup lives in ~/.reelforge/demo.json:
+  {"dir": "<app folder>", "agent": "claude" | "codex",
+   "command": "/record-demo", "codex_command": "$lilo-record-demo"}
+With no "agent" set, Claude Code is used when it is installed, otherwise Codex.
 """
 
 from __future__ import annotations
@@ -19,6 +23,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,10 +32,15 @@ FORMATS = ("walkthrough", "clip", "launch")
 DEMO_ROOT = Path.home() / "Documents" / "Demos"
 CONFIG_NAME = "demo.json"
 DEFAULT_COMMAND = "/record-demo"
+AGENTS = ("claude", "codex")
+AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+# Codex names a skill with a dollar sign. The skill lives in the app folder (.agents/skills).
+DEFAULT_CODEX_COMMAND = "$lilo-record-demo"
 MAX_FEATURE = 300
 MAX_NOTES = 2000
 MAX_LINE = 400
 _COMMAND_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9:_-]{0,80}$")
+_CODEX_COMMAND_RE = re.compile(r"^\$[A-Za-z0-9][A-Za-z0-9_-]{0,80}$")
 _RECORDING_RE = re.compile(r"^RECORDING:\s*(.+?\.mp4)\b", re.MULTILINE)
 _REPORT_KEYS = ("ENGINE", "RECORDING", "FLOW", "SAFETY", "DELIVERY")
 
@@ -38,15 +49,64 @@ class DemoError(ValueError):
     """A request the helper will not run; the message is shown to the person."""
 
 
-def find_claude() -> str | None:
-    found = shutil.which("claude")
+def _find(name: str) -> str | None:
+    """The helper runs under launchd with a short PATH, so the usual install folders are checked too."""
+    found = shutil.which(name)
     if found:
         return found
-    for candidate in (Path.home() / ".local/bin/claude", Path("/opt/homebrew/bin/claude"),
-                      Path("/usr/local/bin/claude")):
+    for folder in (Path.home() / ".local/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")):
+        candidate = folder / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
+
+
+def find_claude() -> str | None:
+    return _find("claude")
+
+
+def find_codex() -> str | None:
+    return _find("codex")
+
+
+def codex_install_argv() -> list[str] | None:
+    """The command that installs Codex: Homebrew, which the helper's installer put on this Mac."""
+    brew = _find("brew")
+    return [brew, "install", "--cask", "codex"] if brew else None
+
+
+def find_agents() -> dict[str, str]:
+    """The agents installed on this Mac: name -> path of its command."""
+    found = {"claude": find_claude(), "codex": find_codex()}
+    return {name: path for name, path in found.items() if path}
+
+
+_SIGNED_IN: dict = {"at": 0.0, "codex": None, "value": False}
+SIGNED_IN_TTL = 10.0
+
+
+def codex_signed_in(codex: str | None, *, fresh: bool = False) -> bool:
+    """Whether Codex on this Mac is signed in (`codex login status` exits 0). The page asks often, so it is cached briefly."""
+    if not codex:
+        return False
+    now = time.monotonic()
+    if not fresh and _SIGNED_IN["codex"] == codex and now - _SIGNED_IN["at"] < SIGNED_IN_TTL:
+        return bool(_SIGNED_IN["value"])
+    try:
+        value = subprocess.run([codex, "login", "status"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        value = False
+    _SIGNED_IN.update(at=now, codex=codex, value=value)
+    return value
+
+
+def agent_of(config: dict, installed: dict[str, str]) -> str | None:
+    """The agent a recording will use: the one chosen on this Mac if it is installed, else the first found."""
+    chosen = config.get("agent")
+    if chosen in installed:
+        return str(chosen)
+    return next((name for name in AGENTS if name in installed), None)
 
 
 def load_config(state_dir: Path) -> dict:
@@ -67,6 +127,11 @@ def command_of(config: dict) -> str:
     return command if _COMMAND_RE.match(command) else DEFAULT_COMMAND
 
 
+def codex_command_of(config: dict) -> str:
+    command = str(config.get("codex_command") or DEFAULT_CODEX_COMMAND)
+    return command if _CODEX_COMMAND_RE.match(command) else DEFAULT_CODEX_COMMAND
+
+
 def folder_of(config: dict) -> Path | None:
     raw = config.get("dir")
     if not raw:
@@ -78,9 +143,13 @@ def folder_of(config: dict) -> Path | None:
 def status(state_dir: Path) -> dict:
     config = load_config(state_dir)
     folder = folder_of(config)
-    claude = find_claude() is not None
-    return {"claude": claude, "dir": str(folder) if folder else None,
-            "ready": claude and folder is not None}
+    installed = find_agents()
+    agent = agent_of(config, installed)
+    signed_in = codex_signed_in(installed.get("codex"))
+    return {"claude": "claude" in installed, "codex": "codex" in installed, "agent": agent,
+            "codex_signed_in": signed_in,
+            "dir": str(folder) if folder else None,
+            "ready": agent is not None and folder is not None and (agent != "codex" or signed_in)}
 
 
 def _one_line(text: str) -> str:
@@ -114,6 +183,7 @@ def demo_request(body: dict) -> dict:
 
 
 def demo_prompt(request: dict, command: str = DEFAULT_COMMAND) -> str:
+    """The prompt for either agent. `command` is how that agent names the skill (/name or $name)."""
     where = ("the app running on this Mac" if request["local"] else "a deployed site, not this Mac. "
              "Do not start or restart local servers for it")
     lines = [
@@ -139,6 +209,12 @@ def demo_argv(claude: str, prompt: str) -> list[str]:
             "--permission-mode", "bypassPermissions"]
 
 
+def codex_argv(codex: str, prompt: str) -> list[str]:
+    """Codex with the same reach Claude gets: no approval prompts, since nobody is there to answer them."""
+    return [codex, "exec", "--json", "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox", prompt]
+
+
 def _clip(text: str) -> str:
     text = _one_line(text)
     return text if len(text) <= MAX_LINE else text[: MAX_LINE - 1] + "…"
@@ -149,6 +225,58 @@ def _tool_line(block: dict) -> str | None:
     detail = given.get("description") or given.get("file_path") or given.get("command") or given.get("url") or ""
     name = str(block.get("name") or "tool")
     return _clip(f"· {name}: {detail}" if detail else f"· {name}")
+
+
+def _report_of(text: str) -> dict:
+    """The skill's closing report -> result fields (the report lines, and the video if it exists)."""
+    updates: dict = {}
+    report = [line.strip() for line in text.splitlines()
+              if line.strip().split(":", 1)[0] in _REPORT_KEYS]
+    if report:
+        updates["report"] = report
+    found = _RECORDING_RE.search(text)
+    if found:
+        path = Path(found.group(1).strip().strip("`")).expanduser()
+        if path.is_file():
+            updates["out"] = str(path)
+    if not report and text.strip():
+        updates["report"] = [_clip(line) for line in text.splitlines() if line.strip()][-8:]
+    return updates
+
+
+def parse_codex_line(raw: str) -> tuple[list[str], dict]:
+    """One line of `codex exec --json` output -> (lines for the page, result fields).
+
+    Codex has no closing result event: its last message is the report. So every
+    message is read as a possible report and a later one replaces an earlier one.
+    """
+    raw = raw.strip()
+    if not raw:
+        return [], {}
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return [_clip(raw)], {}
+    if not isinstance(event, dict):
+        return [], {}
+    kind = event.get("type")
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    if kind == "item.completed" and item.get("type") == "agent_message":
+        text = str(item.get("text") or "")
+        return [_clip(line) for line in text.splitlines() if line.strip()], _report_of(text)
+    if kind == "item.started" and item.get("type") == "command_execution":
+        command = str(item.get("command") or "")
+        # Codex wraps each command in a login shell; show what it ran, not the wrapper.
+        wrapped = re.match(r"^\S*sh -lc (['\"])(.*)\1$", command, re.DOTALL)
+        return [_clip(f"· Shell: {wrapped.group(2) if wrapped else command}")], {}
+    if kind == "item.started" and item.get("type") in ("mcp_tool_call", "web_search", "file_change"):
+        detail = item.get("tool") or item.get("query") or ""
+        return [_clip(f"· {item['type']}: {detail}" if detail else f"· {item['type']}")], {}
+    if kind in ("turn.failed", "error"):
+        error = event.get("error") if isinstance(event.get("error"), dict) else {}
+        said = _clip(str(error.get("message") or event.get("message") or "Codex stopped with an error"))
+        return [said], {"failed": True, "report": [said]}
+    return [], {}
 
 
 def parse_line(raw: str) -> tuple[list[str], dict]:
@@ -178,17 +306,5 @@ def parse_line(raw: str) -> tuple[list[str], dict]:
         return lines, {}
     if kind == "result":
         text = str(event.get("result") or "")
-        updates: dict = {"failed": bool(event.get("is_error"))}
-        report = [line.strip() for line in text.splitlines()
-                  if line.strip().split(":", 1)[0] in _REPORT_KEYS]
-        if report:
-            updates["report"] = report
-        found = _RECORDING_RE.search(text)
-        if found:
-            path = Path(found.group(1).strip().strip("`")).expanduser()
-            if path.is_file():
-                updates["out"] = str(path)
-        if not report and text.strip():
-            updates["report"] = [_clip(line) for line in text.splitlines() if line.strip()][-8:]
-        return [], updates
+        return [], {"failed": bool(event.get("is_error")), **_report_of(text)}
     return [], {}

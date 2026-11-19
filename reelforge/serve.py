@@ -402,11 +402,11 @@ def ask_to_pair(origin: str) -> bool:
     return code == 0 and out == "Allow"
 
 
-def ask_to_record(origin: str, request: dict, folder: Path) -> bool:
-    """Every demo recording starts Claude Code with full access, so the person approves each one."""
-    text = (f"Let Claude record a demo on this Mac?\n\nAsked by: {origin}\nShow: {request['feature']}\n"
+def ask_to_record(origin: str, request: dict, folder: Path, agent: str = "Claude Code") -> bool:
+    """Every demo recording starts a coding agent with full access, so the person approves each one."""
+    text = (f"Let {agent} record a demo on this Mac?\n\nAsked by: {origin}\nShow: {request['feature']}\n"
             f"On: {request['url']}\nWorking in: {folder}\n\n"
-            "Claude Code will run on its own, with full access to this Mac, until the video is made.")
+            f"{agent} will run on its own, with full access to this Mac, until the video is made.")
     script = (
         "tell me to activate\n"
         f"set answer to display dialog {_quote(text)} with title \"Demo recorder\" "
@@ -464,6 +464,7 @@ class Helper:
         self.confirm_demo = confirm_demo
         self.demo_root = demo_root
         self.demo_lock = threading.Lock()
+        self.codex_login_proc: subprocess.Popen | None = None
         self.jobs: dict[str, Job] = {}
         self.pair_lock = threading.Lock()
         self.server: ThreadingHTTPServer | None = None
@@ -523,9 +524,12 @@ class Helper:
         except demo_mod.DemoError as exc:
             raise ApiError(400, str(exc)) from exc
         config = demo_mod.load_config(self.state_dir)
-        claude, folder = demo_mod.find_claude(), demo_mod.folder_of(config)
-        if not claude:
-            raise ApiError(409, "Claude Code is not installed on this Mac")
+        installed, folder = demo_mod.find_agents(), demo_mod.folder_of(config)
+        agent = demo_mod.agent_of(config, installed)
+        if not agent:
+            raise ApiError(409, "neither Claude Code nor Codex is installed on this Mac")
+        if agent == "codex" and not demo_mod.codex_signed_in(installed[agent], fresh=True):
+            raise ApiError(409, "sign in to Codex first")
         if not folder:
             raise ApiError(409, "choose the app folder first")
         if not self.demo_lock.acquire(blocking=False):
@@ -533,18 +537,55 @@ class Helper:
         try:
             if any(j.kind == "demo" and j.status == "running" for j in self.jobs.values()):
                 raise ApiError(409, "a demo is already being recorded")
-            if not self.confirm_demo(origin or "this Mac", request, folder):
+            if not self.confirm_demo(origin or "this Mac", request, folder, demo_mod.AGENT_NAMES[agent]):
                 raise ApiError(403, "the recording was not allowed")
-            prompt = demo_mod.demo_prompt(request, demo_mod.command_of(config))
-            return self.start_job("demo", [], {"feature": request["feature"], "url": request["url"]},
-                                  argv=demo_mod.demo_argv(claude, prompt), cwd=folder,
-                                  parse=demo_mod.parse_line)
+            if agent == "codex":
+                prompt = demo_mod.demo_prompt(request, demo_mod.codex_command_of(config))
+                argv, parse = demo_mod.codex_argv(installed[agent], prompt), demo_mod.parse_codex_line
+            else:
+                prompt = demo_mod.demo_prompt(request, demo_mod.command_of(config))
+                argv, parse = demo_mod.demo_argv(installed[agent], prompt), demo_mod.parse_line
+            return self.start_job("demo", [], {"feature": request["feature"], "url": request["url"], "agent": agent},
+                                  argv=argv, cwd=folder, parse=parse)
         finally:
             self.demo_lock.release()
 
+    def choose_demo_agent(self, body: dict) -> dict:
+        """Which installed agent records. The page may switch between the two; it cannot name a command."""
+        agent = body.get("agent")
+        if agent not in demo_mod.find_agents():
+            raise ApiError(400, "that is not installed on this Mac")
+        config = demo_mod.load_config(self.state_dir)
+        config["agent"] = agent
+        demo_mod.save_config(self.state_dir, config)
+        return demo_mod.status(self.state_dir)
+
+    def install_codex(self) -> dict:
+        """Installs Codex with Homebrew, as a job the page can follow. A fixed command; the page sends nothing."""
+        if demo_mod.find_codex():
+            raise ApiError(409, "Codex is already installed on this Mac")
+        argv = demo_mod.codex_install_argv()
+        if not argv:
+            raise ApiError(409, "Homebrew is not on this Mac, so Codex has to be installed by hand")
+        if any(j.kind == "codex-install" and j.status == "running" for j in self.jobs.values()):
+            raise ApiError(409, "Codex is already being installed")
+        return self.start_job("codex-install", [], {}, argv=argv)
+
+    def codex_login(self) -> dict:
+        """Opens Codex's own sign-in page in the browser. The person signs in there; nothing passes through the page."""
+        codex = demo_mod.find_codex()
+        if not codex:
+            raise ApiError(409, "Codex is not installed on this Mac")
+        with self.demo_lock:
+            if self.codex_login_proc and self.codex_login_proc.poll() is None:
+                self.codex_login_proc.terminate()
+            self.codex_login_proc = subprocess.Popen(
+                [codex, "login"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True}
+
     def choose_demo_dir(self) -> dict:
-        """The folder Claude works in is picked in a native dialog, never sent by the page."""
-        picked = pick("folder", "Choose the app folder Claude should record from")
+        """The folder the agent works in is picked in a native dialog, never sent by the page."""
+        picked = pick("folder", "Choose the app folder to record from")
         if picked:
             config = demo_mod.load_config(self.state_dir)
             config["dir"] = picked[0].rstrip("/")
@@ -621,6 +662,12 @@ class Helper:
             return self.start_job(kind, args, {"out_dir": str(out)})
         if method == "POST" and parts == ["demo"]:
             return self.start_demo(body, origin)
+        if method == "POST" and parts == ["demo", "codex-install"]:
+            return self.install_codex()
+        if method == "POST" and parts == ["demo", "codex-login"]:
+            return self.codex_login()
+        if method == "POST" and parts == ["demo", "agent"]:
+            return self.choose_demo_agent(body)
         if method == "POST" and parts == ["demo", "folder"]:
             return self.choose_demo_dir()
         if len(parts) == 2 and parts[0] == "jobs" and method == "GET":
