@@ -1,0 +1,12 @@
+{
+  "name": "Pathion",
+  "logo": {
+    "dark": "pathion-logo-white.svg",
+    "light": "pathion-logo-ink.svg"
+  },
+  "mark": "pathion-mark.svg",
+  "stripes": {
+    "light": ["--brand-accent", "--brand-alt-1", "--brand-alt-2", "--brand-ink"],
+    "dark": ["--brand-accent", "--brand-alt-1", "--brand-alt-2", "--brand-paper"]
+  }
+}

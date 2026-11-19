@@ -1,0 +1,10 @@
+/* Pathion brand — self-hosted fonts. Paths are relative to the rendered project (the pack is copied to kit/brand/).
+ * Renders run offline, so fonts must be files in this pack, never a Google Fonts link.
+ * Poppins and JetBrains Mono are under the SIL Open Font License 1.1 (fonts/OFL-*.txt). */
+@font-face { font-family: "Poppins"; font-weight: 300; src: url("kit/brand/fonts/poppins-latin-300.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 400; src: url("kit/brand/fonts/poppins-latin-400.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 500; src: url("kit/brand/fonts/poppins-latin-500.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 600; src: url("kit/brand/fonts/poppins-latin-600.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 700; src: url("kit/brand/fonts/poppins-latin-700.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 800; src: url("kit/brand/fonts/poppins-latin-800.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 400 700; src: url("kit/brand/fonts/jetbrains-mono-latin.woff2") format("woff2"); }

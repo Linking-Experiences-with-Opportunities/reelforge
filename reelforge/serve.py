@@ -266,7 +266,8 @@ CODEX_LOGIN_GRACE = 2.0  # seconds a sign-in must survive before the page is tol
 class Job:
     def __init__(self, kind: str, args: list[str], result: dict | None = None, *,
                  argv: list[str] | None = None, cwd: Path | None = None, parse=None,
-                 stdin_text: str | None = None):
+                 stdin_text: str | None = None, env: dict[str, str] | None = None):
+        self.env = env or {}  # added to the helper's own environment
         self.argv = argv  # a whole command instead of `python -m reelforge <args>`
         self.cwd = cwd
         self.parse = parse  # raw output line -> (lines to show, result fields)
@@ -285,7 +286,7 @@ class Job:
 
     def start(self) -> None:
         # UTF-8 both ways: the agents read and write it, and Windows would otherwise use its code page.
-        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", **self.env)
         self.proc = subprocess.Popen(
             self.argv or [sys.executable, "-m", "reelforge", *self.args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -511,8 +512,12 @@ class Helper:
             raise ApiError(409, "neither Claude Code nor Codex is installed on " + native.MACHINE)
         if agent == "codex" and not demo_mod.codex_signed_in(installed[agent], fresh=True):
             raise ApiError(409, "sign in to Codex first")
-        if not folder:
+        # With no app folder the agent uses the kit inside reelforge, in a folder the helper owns.
+        kit = None if folder else demo_mod.kit_dir()
+        if not folder and not kit:
             raise ApiError(409, "choose the app folder first")
+        if kit:
+            folder = demo_mod.work_dir(self.state_dir)
         if not self.demo_lock.acquire(blocking=False):
             raise ApiError(409, f"a demo request is already waiting on {native.MACHINE}")
         try:
@@ -521,13 +526,15 @@ class Helper:
             if not self.confirm_demo(origin or native.MACHINE, request, folder, demo_mod.AGENT_NAMES[agent]):
                 raise ApiError(403, "the recording was not allowed")
             if agent == "codex":
-                prompt = demo_mod.demo_prompt(request, demo_mod.codex_command_of(config))
+                command = demo_mod.codex_command_of(config)
                 argv, parse = demo_mod.codex_argv(installed[agent]), demo_mod.parse_codex_line
             else:
-                prompt = demo_mod.demo_prompt(request, demo_mod.command_of(config))
+                command = demo_mod.command_of(config)
                 argv, parse = demo_mod.demo_argv(installed[agent]), demo_mod.parse_line
+            prompt = demo_mod.builtin_prompt(request, kit, folder) if kit else demo_mod.demo_prompt(request, command)
             return self.start_job("demo", [], {"feature": request["feature"], "url": request["url"], "agent": agent},
-                                  argv=argv, cwd=folder, parse=parse, stdin_text=prompt)
+                                  argv=argv, cwd=folder, parse=parse, stdin_text=prompt,
+                                  env=demo_mod.kit_env(kit) if kit else None)
         finally:
             self.demo_lock.release()
 
@@ -578,6 +585,11 @@ class Helper:
         picked = pick("folder", "Choose the app folder to record from")
         if picked:
             demo_mod.change_config(self.state_dir, dir=native.clean_folder(picked[0]))
+        return demo_mod.status(self.state_dir)
+
+    def forget_demo_dir(self) -> dict:
+        """Back to the kit inside reelforge: the agent stops working in an app folder."""
+        demo_mod.change_config(self.state_dir, dir=None)
         return demo_mod.status(self.state_dir)
 
     def start_job(self, kind: str, args: list[str], result: dict | None = None, **how) -> dict:
@@ -659,6 +671,8 @@ class Helper:
             return self.choose_demo_agent(body)
         if method == "POST" and parts == ["demo", "folder"]:
             return self.choose_demo_dir()
+        if method == "POST" and parts == ["demo", "builtin"]:
+            return self.forget_demo_dir()
         if len(parts) == 2 and parts[0] == "jobs" and method == "GET":
             job = self.jobs.get(parts[1])
             if not job:

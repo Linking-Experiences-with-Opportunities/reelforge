@@ -483,11 +483,24 @@ middle of the set. Without `--out-dir` it only reports.
 
 ### Demo recorder (Claude Code or Codex records a feature demo)
 
-The helper can also start a recording job that is not reelforge at all: `POST /demo` runs a
-record-demo skill in a coding agent on this Mac, either [Claude Code](https://claude.com/claude-code)
-(`/record-demo`) or [Codex](https://developers.openai.com/codex/cli) (`$lilo-record-demo`, a skill
-in the app folder's `.agents/skills`). The page sends what to show, the site's address and the
-format; the agent writes the storyboard, drives a browser and builds the video.
+The helper can also start a recording job that is not reelforge at all: `POST /demo` starts a
+coding agent on this computer, either [Claude Code](https://claude.com/claude-code) or
+[Codex](https://developers.openai.com/codex/cli), with a record-demo skill. The page sends what to
+show, the site's address and the format; the agent writes the storyboard, drives a browser and
+builds the video.
+
+**The skill comes with reelforge.** `reelforge/demo_kit/` holds the record-demo skill text, its
+capture and build scripts and the Pathion brand pack (copied from the public
+[record-demo-kit](https://github.com/maxMyers13/record-demo-kit); see `demo_kit/VENDORED.md`).
+With no app folder chosen, the helper hands the agent that skill as text and points it at the kit
+(`DEMO_KIT_DIR`, `DEMO_BRAND_DIR`), and the agent works in `~/.reelforge/demo-work`. So recording a
+deployed site needs no repository, no GitHub account and no plugin: the helper, an agent, Node 22+
+and ffmpeg (both installers add Node). The first recording sets up Playwright in that work folder.
+
+Choosing an app folder (`POST /demo/folder`) switches to that app's own skill instead: Claude Code
+runs `/record-demo` there, Codex runs `$lilo-record-demo` (a skill in the folder's
+`.agents/skills`). That is for recording a local checkout, with whatever sign-in recipes its skill
+knows. `POST /demo/builtin` forgets the folder and goes back to the kit inside reelforge.
 
 That is an agent running on its own with full access to the Mac, so it is fenced differently from
 the rest:
@@ -505,7 +518,8 @@ the rest:
   signed in;
 - only `https` sites, or `http` on localhost, and one recording at a time.
 
-`GET /health` reports `demo: {claude, codex, codex_signed_in, agent, dir, ready}`. The job's log is the agent's
+`GET /health` reports `demo: {claude, codex, codex_signed_in, agent, dir, kit, ready}`; `kit` is `"builtin"`
+(the kit inside reelforge) or `"app"` (the chosen folder's skill). The job's log is the agent's
 narration; its result carries the MP4 path from the skill's report.
 
 ## Tests

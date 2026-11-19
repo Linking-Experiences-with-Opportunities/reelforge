@@ -1,0 +1,48 @@
+{
+  "_note": "Copy this file to the project folder that holds raw/ (examples/launch-capture.example.cjs records there): paths resolve against the spec's own folder.",
+  "feature": "team-invites",
+  "theme": "light",
+  "video": "raw/main.mp4",
+  "opener": {
+    "words": ["Team", "invites"],
+    "line": "Bring your whole team in, in seconds."
+  },
+  "shots": [
+    {
+      "type": "screen",
+      "from": "open",
+      "to": { "beat": "pressed", "plus": 0.6 },
+      "say": { "title": "Open team settings", "sub": "Everyone on the workspace, with their role." }
+    },
+    {
+      "type": "focus",
+      "from": "email",
+      "to": "send",
+      "maxFill": 0.8,
+      "say": { "title": "Add an email", "sub": "Type who you want to invite." }
+    },
+    {
+      "type": "title",
+      "text": "One invite, the right role.",
+      "accent": [3, 4],
+      "dur": 2.3
+    },
+    {
+      "type": "screen",
+      "from": "send",
+      "dur": 4,
+      "say": { "title": "Send it", "sub": "The invite shows as pending until they accept." }
+    },
+    {
+      "type": "card",
+      "eyebrow": "Invite sent",
+      "title": "sam@example.com is pending.",
+      "sub": "Role · Editor",
+      "row": { "label": "Team settings", "meta": "1 pending invite", "cta": "Open" }
+    }
+  ],
+  "outro": {
+    "line": "Invite your team today.",
+    "url": "example.com"
+  }
+}

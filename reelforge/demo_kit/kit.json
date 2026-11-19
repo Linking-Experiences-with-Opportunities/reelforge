@@ -1,0 +1,46 @@
+{
+  "name": "record-demo-kit",
+  "version": "1.0.0",
+  "hyperframes": "0.8.73",
+  "gsap": "3.14.2",
+  "node": ">=22",
+  "ffmpeg": {
+    "encoders": [
+      "libx264"
+    ]
+  },
+  "canvas": {
+    "width": 1920,
+    "height": 1080
+  },
+  "intro": 3.6,
+  "outro": 4.2,
+  "limits": {
+    "singleFeatureSeconds": 45,
+    "walkthroughSeconds": 180,
+    "maxRate": 1.5,
+    "titleWords": 4,
+    "subChars": 90
+  },
+  "clip": {
+    "maxWidth": 900,
+    "crf": 20,
+    "warnKbps": 250
+  },
+  "launch": {
+    "maxSeconds": 45,
+    "opener": 4.6,
+    "outro": 4.0,
+    "move": 0.8,
+    "minHold": 1.0,
+    "maxWidth": 900,
+    "wideMargin": 1.12,
+    "maxWideHold": 2.2,
+    "lockupWords": 4,
+    "lineWords": 8,
+    "crf": 18,
+    "railWidth": 420,
+    "maxUpscale": 1.4,
+    "cursorSize": 0.052
+  }
+}

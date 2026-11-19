@@ -1,0 +1,41 @@
+/* Pathion brand — design tokens (values from the Pathion design system).
+ * This file is the brand contract: every color a demo may use lives here, and brand-lint rejects any other.
+ * Light set on :root (launch films), dark set on [data-theme="dark"] (walkthroughs and clips).
+ * Keep the variable NAMES (the builders reference them). */
+:root {
+  --brand-accent: #0b56f6;
+  --brand-alt-1: #e50108;
+  --brand-alt-2: #fae34c;
+  --brand-ink: #151515;
+  --brand-paper: #fcfef0;
+
+  --bg-page: #fcfef0;
+  --bg-surface: #fefffa;
+  --bg-surface-2: #f3f4e8;
+  --border-default: #c9cabf;
+  --text-primary: #151515;
+  --text-secondary: #55564f;
+  --text-tertiary: #767770;
+  --text-accent: #0b56f6;
+  --status-success: #0f9b3a;
+  --accent-active: #0b56f6;
+
+  --radius-lg: 12px;
+  --radius-full: 9999px;
+  --font-sans: "Poppins", system-ui, sans-serif;
+  --font-display: var(--font-sans);
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+[data-theme="dark"] {
+  --bg-page: #0c0c0c;
+  --bg-surface: #151515;
+  --bg-surface-2: #1c1c1b;
+  --border-default: #3a3b36;
+  --text-primary: #fcfef0;
+  --text-secondary: #a3a49a;
+  --text-tertiary: #767770;
+  --text-accent: #6f96f9;
+  --status-success: #1bc20d;
+  --accent-active: #6f96f9;
+}

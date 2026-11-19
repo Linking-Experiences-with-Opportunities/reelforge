@@ -51,8 +51,9 @@
   if (-not (Have 'winget')) {
     Fail 'This needs winget (App Installer). Install "App Installer" from the Microsoft Store, then run this again.'
   }
-  Say 'Installing the video tools (ffmpeg, yt-dlp, git, uv)'
-  $tools = [ordered]@{ ffmpeg = 'Gyan.FFmpeg'; 'yt-dlp' = 'yt-dlp.yt-dlp'; git = 'Git.Git'; uv = 'astral-sh.uv' }
+  Say 'Installing the video tools (ffmpeg, yt-dlp, git, uv, node)'
+  # node runs the demo recorder's kit (the browser capture and the video build).
+  $tools = [ordered]@{ ffmpeg = 'Gyan.FFmpeg'; 'yt-dlp' = 'yt-dlp.yt-dlp'; git = 'Git.Git'; uv = 'astral-sh.uv'; node = 'OpenJS.NodeJS.LTS' }
   foreach ($name in $tools.Keys) {
     if (-not (Have $name)) {
       if (-not (Winget-Install $tools[$name])) { Fail "Could not install $name. Send this window's text to Max." }
