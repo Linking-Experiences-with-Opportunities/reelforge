@@ -6,14 +6,14 @@
 //   cp "$KIT/examples/walkthrough.demo.json" demo.json
 //   node "$KIT/scripts/detect-beats.mjs" --marks raw/marks.json --video main=raw/main.mp4 --out beats.json
 //   node "$KIT/scripts/build-demo.mjs" --spec demo.json --beats beats.json --project hf --stage prepare   # LOOK at the contact sheets
-//   node "$KIT/scripts/build-demo.mjs" --spec demo.json --project hf --stage render --out ~/Documents/Demos/features/team-invites-walkthrough.mp4
+//   node "$KIT/scripts/build-demo.mjs" --spec demo.json --beats beats.json --project hf --stage render --out ~/Documents/Demos/features/team-invites-walkthrough.mp4
 const os = require('node:os'), path = require('node:path');
 const kit = require(process.env.KIT + '/scripts/capture-kit.cjs');
 const baseURL = process.env.BASE_URL || 'http://localhost:3000';
 const PROJECT = process.env.PROJECT || path.join(os.homedir(), 'Documents/Demos/projects/team-invites');
 (async () => {
   const s = await kit.start({
-    playwright: require('playwright'), baseURL, outDir: path.join(PROJECT, 'raw'),
+    playwright: require(require.resolve('playwright', { paths: [process.cwd()] })), baseURL, outDir: path.join(PROJECT, 'raw'),
     hideText: [],                 // exact text of your app's dev-only floating buttons, e.g. ['Reset onboarding']
     hideSelectors: '',            // or CSS selectors for them
   });

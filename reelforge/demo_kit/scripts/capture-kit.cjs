@@ -123,7 +123,7 @@ async function startLoop(context, page, dir, vp) {
 function assemble(frames, out, fps, vp) {
   const list = path.join(path.dirname(out), path.basename(out, '.mp4') + '-frames.txt');
   const lines = ['ffconcat version 1.0'];
-  frames.forEach((f, i) => { lines.push(`file '${f.file.replace(/'/g, "'\\''")}'`); lines.push(`duration ${Math.max(0.02, ((frames[i + 1]?.t ?? f.t + 0.25) - f.t)).toFixed(3)}`); });
+  frames.forEach((f, i) => { lines.push(`file '${path.resolve(f.file).replace(/'/g, "'\\''")}'`); lines.push(`duration ${Math.max(0.02, ((frames[i + 1]?.t ?? f.t + 0.25) - f.t)).toFixed(3)}`); });
   fs.writeFileSync(list, lines.join('\n'));
   const r = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', list, '-vf', `scale=${vp.width * vp.dsf}:${vp.height * vp.dsf}:flags=lanczos,fps=${fps},format=yuv420p`, '-c:v', 'libx264', '-crf', '15', '-preset', 'veryfast', '-an', out]);
   fs.rmSync(list, { force: true });

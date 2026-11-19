@@ -13,7 +13,7 @@ import { dirname, join, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { lintProject } from './brand-lint.mjs';
-import { loadBrand, stageKit, tokenBlock } from './brand.mjs';
+import { loadBrand, stageKit, tokenBlock, npx } from './brand.mjs';
 
 const KIT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const kit = JSON.parse(readFileSync(join(KIT, 'kit.json'), 'utf8'));
@@ -175,7 +175,7 @@ ${js.join('\n')}
 
 // ---------- project scaffold ----------
 function hf(a, opts = {}) {
-  const r = spawnSync('npx', ['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd: opts.cwd || project, encoding: 'utf8', maxBuffer: 1 << 28 });
+  const r = npx(['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd: opts.cwd || project, encoding: 'utf8', maxBuffer: 1 << 28 });
   return { code: r.status ?? 1, out: `${r.stdout || ''}${r.stderr || ''}` };
 }
 function prepare() {

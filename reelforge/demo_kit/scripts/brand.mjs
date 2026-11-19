@@ -5,7 +5,7 @@
 //   1. $DEMO_BRAND_DIR
 //   2. ~/.config/record-demo/brand   (where `init-brand.mjs` puts yours, so plugin updates never overwrite it)
 //   3. <kit>/brand                   (the neutral example brand that ships with the kit)
-import { readFileSync, existsSync, mkdirSync, cpSync, copyFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, cpSync, copyFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -35,6 +35,13 @@ export function loadBrand(dir = brandDir()) {
   };
 }
 
+// Run npx. On Windows npx is a .cmd file, which only starts through a shell; arguments with spaces are quoted for it.
+export function npx(args, opts = {}) {
+  if (process.platform !== 'win32') return spawnSync('npx', args, opts);
+  const quote = (s) => (/[\s"&|<>^()]/.test(String(s)) ? `"${String(s).replace(/"/g, '\\"')}"` : String(s));
+  return spawnSync(['npx', ...args].map(quote).join(' '), { ...opts, shell: true });
+}
+
 // GSAP is not redistributed in this repo: it is fetched once (pinned) into a cache and copied into each project.
 export function ensureGsap() {
   const kit = JSON.parse(readFileSync(join(KIT, 'kit.json'), 'utf8'));
@@ -42,7 +49,10 @@ export function ensureGsap() {
   const cache = join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'record-demo-kit', `gsap-${v}.min.js`);
   if (!existsSync(cache)) {
     mkdirSync(dirname(cache), { recursive: true });
-    const r = spawnSync('curl', ['-fsSL', '-o', cache, `https://cdn.jsdelivr.net/npm/gsap@${v}/dist/gsap.min.js`], { encoding: 'utf8' });
+    // Downloaded beside the cache file and moved into place only when whole, so a broken download is retried next time.
+    const part = `${cache}.${process.pid}.part`;
+    const r = spawnSync('curl', ['-fsSL', '-o', part, `https://cdn.jsdelivr.net/npm/gsap@${v}/dist/gsap.min.js`], { encoding: 'utf8' });
+    if (r.status === 0 && existsSync(part)) renameSync(part, cache); else rmSync(part, { force: true });
     if (r.status !== 0 || !existsSync(cache)) throw new Error(`could not download GSAP ${v} (network needed on first use): ${(r.stderr || '').trim()}`);
   }
   return cache;

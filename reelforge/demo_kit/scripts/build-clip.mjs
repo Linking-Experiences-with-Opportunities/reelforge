@@ -13,7 +13,7 @@ import { dirname, join, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { lintProject } from './brand-lint.mjs';
-import { loadBrand, stageKit, tokenBlock } from './brand.mjs';
+import { loadBrand, stageKit, tokenBlock, npx } from './brand.mjs';
 
 const KIT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const kit = JSON.parse(readFileSync(join(KIT, 'kit.json'), 'utf8'));
@@ -134,7 +134,7 @@ ${js.join('\n')}
 </script></body></html>
 `;
 
-const hf = (a, cwd = project) => { const r = spawnSync('npx', ['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd, encoding: 'utf8', maxBuffer: 1 << 28 }); return { code: r.status ?? 1, out: `${r.stdout || ''}${r.stderr || ''}` }; };
+const hf = (a, cwd = project) => { const r = npx(['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd, encoding: 'utf8', maxBuffer: 1 << 28 }); return { code: r.status ?? 1, out: `${r.stdout || ''}${r.stderr || ''}` }; };
 const meta = { seat, from: Number(from.toFixed(2)), to: Number(to.toFixed(2)), duration: Number(D.toFixed(2)), canvas: [CW, CH], maxWidth: maxW, shots: shots.map((s) => ({ t: Number(s.t.toFixed(2)), x: Math.round(s.rect.x), y: Math.round(s.rect.y), w: Math.round(s.rect.w), h: Math.round(s.rect.h) })), rings: rings.length };
 
 function prepare() {

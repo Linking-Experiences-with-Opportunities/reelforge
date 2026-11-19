@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { lintProject } from './brand-lint.mjs';
-import { loadBrand, stageKit, tokenBlock } from './brand.mjs';
+import { loadBrand, stageKit, tokenBlock, npx } from './brand.mjs';
 
 const KIT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const kit = JSON.parse(readFileSync(join(KIT, 'kit.json'), 'utf8'));
@@ -116,7 +116,7 @@ for (const p of placed) {
   const end = p.cs + p.cd - 0.5;
   const tAt = (item) => {
     if (item.at == null) return p.cs;
-    const t = FOOTAGE.has(p.type) && typeof item.at !== 'number' ? p.cs + (at(p.seat, item.at) - p.from) / (p.rate ?? 1) : p.cs + Number(item.at);
+    const t = FOOTAGE.has(p.type) ? p.cs + (at(p.seat, item.at) - p.from) / (p.rate ?? 1) : p.cs + Number(item.at);
     if (t < p.cs - 0.05 || t > end) warn(`shot ${p.i + 1}: narration "${item.title}" lands outside the shot — clamped`);
     return clamp(t, p.cs, Math.max(p.cs, end));
   };
@@ -550,7 +550,7 @@ ${js.join('\n')}
 `;
 
 // ---------- build ----------
-const hf = (a, cwd = project) => { const r = spawnSync('npx', ['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd, encoding: 'utf8', maxBuffer: 1 << 28 }); return { code: r.status ?? 1, out: `${r.stdout || ''}${r.stderr || ''}` }; };
+const hf = (a, cwd = project) => { const r = npx(['-y', `hyperframes@${kit.hyperframes}`, ...a], { cwd, encoding: 'utf8', maxBuffer: 1 << 28 }); return { code: r.status ?? 1, out: `${r.stdout || ''}${r.stderr || ''}` }; };
 const meta = {
   theme: THEME, canvas: [CW, CH], stage: [SW, CH], rail: RAIL ? lines.map((l, k) => ({ t: Number(l.t.toFixed(2)), title: l.title, shown: shows.filter((x) => x.k === k).map((x) => [Number(x.on.toFixed(2)), Number(x.off.toFixed(2))]) })) : false, duration: Number(TOTAL.toFixed(2)), opener: OPEN_D, outro: OUT_D, maxWidth: maxW,
   shots: placed.map((p) => ({ type: p.type, at: Number(p.cs.toFixed(2)), dur: Number(p.cd.toFixed(2)), ...(p.camera ? { camera: p.camera.map((c) => ({ t: Number(c.t.toFixed(2)), w: Math.round(c.rect.w), wide: !!c.rect.wide })) } : {}), ...(p.zoom ? { zoom: p.zoom, crop: p.crop } : {}) })),

@@ -11,7 +11,7 @@ const kit = require(process.env.KIT + '/scripts/capture-kit.cjs');
 const baseURL = process.env.BASE_URL || 'http://localhost:3000';
 const PROJECT = process.env.PROJECT || path.join(os.homedir(), 'Documents/Demos/projects/team-invites-launch');
 (async () => {
-  const s = await kit.start({ playwright: require('playwright'), baseURL, outDir: path.join(PROJECT, 'raw'), hires: true, cursor: 'none' });
+  const s = await kit.start({ playwright: require(require.resolve('playwright', { paths: [process.cwd()] })), baseURL, outDir: path.join(PROJECT, 'raw'), hires: true, cursor: 'none' });
   const me = await s.seat('main');
   const p = me.page;
   // Launch films are light. If your app has a theme switch, force light before the first goto, e.g.:

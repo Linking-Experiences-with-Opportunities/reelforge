@@ -4,7 +4,7 @@
 const kit = require(process.env.KIT + '/scripts/capture-kit.cjs');
 const baseURL = process.env.BASE_URL || 'http://localhost:3000';
 (async () => {
-  const s = await kit.start({ playwright: require('playwright'), baseURL, outDir: './raw', hires: true });   // true 2880x1800 frames
+  const s = await kit.start({ playwright: require(require.resolve('playwright', { paths: [process.cwd()] })), baseURL, outDir: './raw', hires: true });   // true 2880x1800 frames
   const me = await s.seat('main');
   const p = me.page;
   await p.goto(baseURL + '/settings/team', { waitUntil: 'networkidle' }); await me.wait(2000);
