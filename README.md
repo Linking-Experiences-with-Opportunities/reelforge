@@ -433,6 +433,28 @@ restart call (`POST /restart`) is how an update is picked up without a reboot.
 Windows is not built yet: the installer, the file windows and the start-at-login
 piece are macOS only.
 
+The same page also runs three footage tools through the helper, each the ordinary CLI:
+
+| On the page | Route | Runs | Lands in `~/Movies/Reelforge/` |
+|---|---|---|---|
+| Podcast sync | `POST /sync` `{videos, takes}` | `reelforge sync` | `Podcast sync/<time>/` (synced copies + `sync-report.json`) |
+| Speaker labels | `POST /speakers` `{take, mics: [{name, path}], sync_report?}` | `reelforge speakers` (whisper writes the transcript) | `Speaker labels/<time>/` (`.txt`, `.srt`, one SRT per camera) |
+| Camera matching | `POST /match` `{cameras: [{name, paths}], ref, smooth?}` | `reelforge match` | `Camera matching/<time>/` (corrected copies + `match-report.json`) |
+
+`/health` lists them under `features`, so the page can tell an older helper to update.
+
+### Camera matching (`reelforge match`)
+
+```bash
+reelforge match --camera sony day1/sony/ --camera phone day1/phone/ --ref sony --out-dir matched/
+```
+
+Measures every clip, takes each camera's median, and corrects the other cameras to the
+reference one. Every clip from a camera gets the same correction: differences between scenes
+are kept, the difference between cameras is removed. iPhone HDR clips are converted to SDR
+on the way (macOS). `--smooth 0.5` also nudges each clip's brightness halfway toward the
+middle of the set. Without `--out-dir` it only reports.
+
 ---
 
 ### Demo recorder (Claude Code records a feature demo)

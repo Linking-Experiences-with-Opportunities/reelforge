@@ -39,13 +39,15 @@ DEFAULT_PORT = 47821
 DEFAULT_ORIGINS = ("https://marketing.pathion.dev",)
 STATE_DIR = Path.home() / ".reelforge"
 OUTPUT_DIR = Path.home() / "Movies" / "Reelforge"
-AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff"}
 BROWSERS = {"safari", "chrome", "firefox", "edge", "brave"}
 FITS = {"cover", "contain", "blur"}
 AUDIO_MODES = {"music", "source", "silent"}
 MAX_BODY = 4 * 1024 * 1024
 MAX_LOG_LINES = 4000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+FEATURES = ("sync", "speakers", "match")
+_SPEAKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._'-]{0,39}$")
 _PROJECT_LINE = re.compile(r"^-> project (.+)$")
 _OUT_LINE = re.compile(r"^-> (.+\.mp4)\s+\(")
 
@@ -151,6 +153,82 @@ def render_args(body: dict, projects: Path, out_dir: Path, stamp: str) -> tuple[
     return args, out
 
 
+def _existing(paths: list[str], label: str) -> list[str]:
+    for path in paths:
+        if path.startswith("-") or not Path(path).exists():
+            raise ApiError(400, f"{label}: {Path(path).name} is not on this Mac")
+    return paths
+
+
+def sync_args(body: dict, out_dir: Path) -> list[str]:
+    """Podcast sync: camera files matched to the recorder's takes and given its audio."""
+    videos = _existing(_paths(body.get("videos"), "videos"), "videos")
+    takes = _existing(_paths(body.get("takes"), "takes"), "takes")
+    if not videos:
+        raise ApiError(400, "pick the camera videos")
+    if not takes:
+        raise ApiError(400, "pick the recorder's audio")
+    return ["sync", "--videos", *videos, "--takes", *takes,
+            "--out-dir", str(out_dir), "--report", str(out_dir / "sync-report.json")]
+
+
+def speakers_args(body: dict, out_dir: Path) -> list[str]:
+    """Speaker labels for a take, from one mic track per person."""
+    take = _existing(_paths([body.get("take")] if body.get("take") else [], "take"), "take")
+    if not take:
+        raise ApiError(400, "pick the take to label")
+    mics = body.get("mics")
+    if not isinstance(mics, list) or not mics:
+        raise ApiError(400, "add each person's mic track")
+    args = ["speakers", "--take", take[0], "--out-dir", str(out_dir)]
+    seen: set[str] = set()
+    for mic in mics:
+        name = str((mic or {}).get("name") or "").strip() if isinstance(mic, dict) else ""
+        path = _existing(_paths([mic.get("path")] if isinstance(mic, dict) and mic.get("path") else [], "mic"), "mic")
+        if not _SPEAKER_RE.match(name) or "/" in name or "=" in name:
+            raise ApiError(400, "give each mic the name of the person on it")
+        if name.lower() in seen:
+            raise ApiError(400, f"{name} is on two mics")
+        if not path:
+            raise ApiError(400, f"pick {name}'s mic track")
+        seen.add(name.lower())
+        args += ["--mic", f"{name}={path[0]}"]
+    report = str(body.get("sync_report") or "").strip()
+    if report:
+        args += ["--sync-report", _existing(_paths([report], "sync report"), "sync report")[0]]
+    return args
+
+
+def match_args(body: dict, out_dir: Path) -> list[str]:
+    """Camera matching: every other camera's clips corrected to the reference camera."""
+    cameras = body.get("cameras")
+    if not isinstance(cameras, list) or len(cameras) < 2:
+        raise ApiError(400, "add at least two cameras")
+    args = ["match"]
+    names: list[str] = []
+    for camera in cameras:
+        name = str((camera or {}).get("name") or "").strip() if isinstance(camera, dict) else ""
+        if not _SPEAKER_RE.match(name):
+            raise ApiError(400, "give each camera a short name")
+        if name.lower() in (n.lower() for n in names):
+            raise ApiError(400, f"two cameras are named {name}")
+        paths = _existing(_paths(camera.get("paths"), "clips"), "clips")
+        if not paths:
+            raise ApiError(400, f"pick the clips from {name}")
+        names.append(name)
+        args += ["--camera", name, *paths]
+    ref = str(body.get("ref") or names[0])
+    if ref not in names:
+        raise ApiError(400, "the camera to match to is not one of the cameras")
+    args += ["--ref", ref, "--out-dir", str(out_dir), "--report", str(out_dir / "match-report.json")]
+    smooth = body.get("smooth")
+    if smooth not in (None, "", 0):
+        if not isinstance(smooth, (int, float)) or isinstance(smooth, bool) or not 0 <= smooth <= 1:
+            raise ApiError(400, "smoothing is between 0 and 1")
+        args += ["--smooth", f"{float(smooth):.2f}"]
+    return args
+
+
 def tool_status() -> dict:
     return {tool: have(tool) for tool in ("ffmpeg", "ffprobe", "yt-dlp", "whisper", "tesseract")}
 
@@ -226,6 +304,11 @@ class Job:
                 found = _PROJECT_LINE.match(line)
                 if found and self.kind == "ingest":
                     self.result["project"] = Path(found.group(1).strip()).name
+                if self.kind in FEATURES:
+                    if line.startswith("-> "):
+                        self.result["summary"] = line[3:].strip()
+                    elif line.startswith("error: "):
+                        self.result["error"] = line[7:].strip()
         code = self.proc.wait()
         with self.lock:
             if self.status == "running":
@@ -275,6 +358,8 @@ PICK_KINDS = {
     "media": (VIDEO_SUFFIXES | IMAGE_SUFFIXES, True),
     "images": (IMAGE_SUFFIXES | VIDEO_SUFFIXES, True),
     "audio": (AUDIO_SUFFIXES, False),
+    "videos": (VIDEO_SUFFIXES, True),
+    "audios": (AUDIO_SUFFIXES, True),
 }
 
 
@@ -378,6 +463,7 @@ class Helper:
             "tools": tools, "ready": tools["ffmpeg"] and tools["ffprobe"],
             "projects_dir": str(self.projects), "output_dir": str(self.out_dir),
             "demo": demo_mod.status(self.state_dir),
+            "features": list(FEATURES),
         }
 
     def list_projects(self) -> list[dict]:
@@ -511,6 +597,14 @@ class Helper:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             args, out = render_args(body, self.projects, self.out_dir, time.strftime("%Y%m%d-%H%M%S"))
             return self.start_job("render", args, {"out": str(out), "project": body.get("project")})
+        if method == "POST" and parts in (["sync"], ["speakers"], ["match"]):
+            kind = parts[0]
+            build = {"sync": sync_args, "speakers": speakers_args, "match": match_args}[kind]
+            folder = {"sync": "Podcast sync", "speakers": "Speaker labels", "match": "Camera matching"}[kind]
+            out = self.out_dir / folder / time.strftime("%Y%m%d-%H%M%S")
+            args = build(body, out)
+            out.mkdir(parents=True, exist_ok=True)
+            return self.start_job(kind, args, {"out_dir": str(out)})
         if method == "POST" and parts == ["demo"]:
             return self.start_demo(body, origin)
         if method == "POST" and parts == ["demo", "folder"]:

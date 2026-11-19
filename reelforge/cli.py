@@ -10,13 +10,14 @@ from pathlib import Path
 from . import analyze as analyze_mod
 from . import captions as captions_mod
 from . import ingest as ingest_mod
+from . import match as match_mod
 from . import recipe as recipe_mod
 from . import render as render_mod
 from . import serve as serve_mod
 from . import sheet as sheet_mod
 from . import speakers as speakers_mod
 from . import sync as sync_mod
-from .shell import ToolError, have
+from .shell import ToolError, have, run
 
 DEFAULT_PROJECTS = Path.home() / "reelforge-projects"
 
@@ -386,6 +387,89 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _transcribe_take(take: Path, out_dir: Path, model: str) -> Path:
+    """Whisper's JSON transcript of a take, written beside the other outputs."""
+    if not take.is_file():
+        raise ToolError(f"take not found: {take}")
+    if not have("whisper"):
+        raise ToolError("whisper is not installed (pip install -U openai-whisper); "
+                        "or pass --transcript")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _print(f"-> transcribing {take.name} (whisper {model}); a long take needs a while")
+    proc = run(["whisper", str(take), "--model", model, "--output_format", "json",
+                "--output_dir", str(out_dir), "--verbose", "False", "--fp16", "False"],
+               check=False)
+    written = out_dir / f"{take.stem}.json"
+    if proc.returncode != 0 or not written.is_file():
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+        raise ToolError(f"whisper could not transcribe {take.name}: {tail}")
+    return written
+
+
+def cmd_match(args: argparse.Namespace) -> int:
+    cameras: dict[str, list[Path]] = {}
+    for spec in args.camera:
+        name, paths = spec[0].strip(), spec[1:]
+        if not name or not paths:
+            raise ToolError("--camera needs a name and at least one file or folder")
+        if name in cameras:
+            raise ToolError(f"camera {name!r} is given twice")
+        cameras[name] = sync_mod.expand(paths, sync_mod.VIDEO_EXTS)
+        if not cameras[name]:
+            raise ToolError(f"no video files found for camera {name!r}")
+    if len(cameras) < 2 and not args.smooth:
+        raise ToolError("matching needs two cameras (or --smooth to even out one camera)")
+    if not 0 <= args.smooth <= 1:
+        raise ToolError("--smooth is between 0 and 1")
+    ref = args.ref or next(iter(cameras))
+
+    clips = [match_mod.probe_clip(cam, path) for cam, paths in cameras.items() for path in paths]
+    _print(f"-> {len(clips)} clip(s) from {len(cameras)} camera(s); reference: {ref}")
+    for i, clip in enumerate(clips, 1):
+        match_mod.measure(clip)
+        _print(f"   measured {i}/{len(clips)}  {clip.cam:<10} {clip.path.name[:34]:<34} {clip.stats}"
+               + ("  (HDR)" if clip.hdr else ""))
+    plan = match_mod.make_plan(clips, ref, args.smooth)
+
+    _print()
+    for cam, stats in sorted(plan.cams.items()):
+        _print(f"  camera {cam:<12} {stats}{'   <- reference' if cam == ref else ''}")
+    _print()
+
+    out_dir = Path(args.out_dir).expanduser() if args.out_dir else None
+    stems = [c.path.stem for c in clips]
+    names = [f"{c.cam}-{c.path.stem}" if stems.count(c.path.stem) > 1 else c.path.stem
+             for c in clips]
+    if len(set(names)) != len(names):
+        raise ToolError("two clips from one camera share a file name; rename one of them")
+    filters: dict[str, str] = {}
+    outputs: dict[str, str] = {}
+    written = 0
+    for clip, name in zip(clips, names):
+        vf = plan.filter_for(clip)
+        filters[str(clip.path)] = vf
+        change = match_mod.describe(vf)
+        if not vf and not clip.hdr:
+            _print(f"   keep     {clip.path.name}  (already matches)")
+            continue
+        if out_dir is None:
+            _print(f"   would fix {clip.path.name}  ({change})")
+            continue
+        out = out_dir / f"{name}{args.suffix}.mp4"
+        _print(f"   fixing   {clip.path.name} -> {out.name}  ({change})")
+        match_mod.encode(clip, vf, out)
+        outputs[str(clip.path)] = str(out)
+        written += 1
+
+    if args.report:
+        match_mod.write_report(plan, clips, filters, outputs, Path(args.report).expanduser())
+        _print(f"-> report {args.report}")
+    if out_dir is not None:
+        _print(f"-> {written} matched video(s) in {out_dir}" if written
+               else "-> nothing to fix: the cameras already match")
+    return 0
+
+
 def cmd_speakers(args: argparse.Namespace) -> int:
     mics = [speakers_mod.parse_mic(m) for m in args.mic]
     for m in mics:
@@ -395,7 +479,13 @@ def cmd_speakers(args: argparse.Namespace) -> int:
     known = {n for m in mics for n in m.names}
     if unknown := [n for n in anchors if n not in known]:
         raise ToolError(f"--anchor for {', '.join(unknown)}, who is on no --mic")
-    transcript = Path(args.transcript).expanduser()
+    if args.transcript:
+        transcript = Path(args.transcript).expanduser()
+    else:
+        if not args.take:
+            raise ToolError("give --transcript, or --take to have whisper write one")
+        transcript = _transcribe_take(Path(args.take).expanduser(),
+                                      Path(args.out_dir).expanduser(), args.whisper_model)
     segments = speakers_mod.load_transcript(transcript)
     _print(f"-> {len(segments)} segments, {len(mics)} mic(s)")
     speakers_mod.label(segments, mics, anchors, log=_print)
@@ -629,8 +719,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_spk = sub.add_parser(
         "speakers", help="label a transcript by speaker from per-mic recorder tracks")
-    p_spk.add_argument("--transcript", required=True, metavar="JSON",
-                       help="whisper-cli -oj or openai-whisper JSON of the take")
+    p_spk.add_argument("--transcript", metavar="JSON",
+                       help="whisper-cli -oj or openai-whisper JSON of the take "
+                            "(left out, whisper transcribes --take)")
+    p_spk.add_argument("--whisper-model", default="base",
+                       help="whisper model when it writes the transcript (default: base)")
     p_spk.add_argument("--mic", action="append", required=True, metavar="NAME=PATH",
                        help="one per mic track, e.g. Max=MIC1.WAV; a shared mic is "
                             "David/Papa=MIC3.WAV (needs --anchor for each)")
@@ -644,6 +737,23 @@ def build_parser() -> argparse.ArgumentParser:
                        help="sync --report output: also write one SRT per matched "
                             "video, in that video's time (needs --take)")
     p_spk.set_defaults(func=cmd_speakers)
+
+    p_match = sub.add_parser(
+        "match", help="make footage from different cameras look like one camera shot it")
+    p_match.add_argument("--camera", action="append", nargs="+", required=True,
+                         metavar="NAME_THEN_PATHS",
+                         help="a camera's name, then its clips (files and/or folders); "
+                              "repeat per camera: --camera sony a.mp4 --camera phone clips/")
+    p_match.add_argument("--ref", metavar="NAME",
+                         help="the camera the others are matched to (default: the first)")
+    p_match.add_argument("--smooth", type=float, default=0.0,
+                         help="0-1: how far to also nudge each clip's brightness toward "
+                              "the middle of the set (default: 0)")
+    p_match.add_argument("--out-dir", metavar="DIR",
+                         help="write corrected copies here; without it, only report")
+    p_match.add_argument("--report", metavar="FILE", help="write measurements and filters as JSON")
+    p_match.add_argument("--suffix", default="-matched", help="added to output file names")
+    p_match.set_defaults(func=cmd_match)
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)
