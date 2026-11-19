@@ -1061,7 +1061,40 @@ class TestServeHelper(unittest.TestCase):
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return script
 
-    def _demo_ready(self, *, allow=True, error=False):
+    def _fake_codex(self, recording: Path, *, error=False):
+        """A stand-in for Codex that prints the events `codex exec --json` would."""
+        import stat
+        root = Path(self.tmp.name)
+        events = [
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Writing the storyboard."}},
+            {"type": "item.started", "item": {"type": "command_execution", "command": "/bin/zsh -lc 'node capture.cjs'"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "/bin/zsh -lc 'node capture.cjs'", "exit_code": 0}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text":
+                f"ENGINE: ffmpeg + format=walkthrough\nRECORDING: {recording} (1 MB, 20s, 1920x1080)\n"
+                "FLOW: opens settings\nSAFETY: read-only flow\nDELIVERY: in the folder"}},
+            {"type": "turn.failed", "error": {"message": "usage limit reached"}} if error else {"type": "turn.completed"},
+        ]
+        script = root / "codex"
+        lines = "\n".join(json.dumps(e) for e in events)
+        script.write_text(f"#!/bin/sh\npwd > '{root}/cwd.txt'\nprintf '%s\\n' \"$@\" > '{root}/args.txt'\n"
+                          f"cat <<'JSON'\n{lines}\nJSON\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        return script
+
+    def _only_agents(self, **paths):
+        """Pretend exactly these agents are installed, whatever this machine really has."""
+        from reelforge import demo
+        for name in ("claude", "codex"):
+            patch = mock.patch.object(demo, f"find_{name}", return_value=paths.get(name))
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.signed_in = True
+        patch = mock.patch.object(demo, "codex_signed_in", side_effect=lambda codex, **_: bool(codex) and self.signed_in)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _demo_ready(self, *, allow=True, error=False, agents=("claude",)):
         from reelforge import demo
         root = Path(self.tmp.name)
         recording = root / "Demos" / "features" / "settings-walkthrough.mp4"
@@ -1070,13 +1103,11 @@ class TestServeHelper(unittest.TestCase):
         app = root / "app"
         app.mkdir()
         demo.save_config(self.helper.state_dir, {"dir": str(app)})
-        script = self._fake_claude(recording, error=error)
+        fakes = {"claude": self._fake_claude, "codex": self._fake_codex}
         self.asked = []
-        self.helper.confirm_demo = lambda origin, request, folder: (self.asked.append((origin, request, folder)), allow)[1]
+        self.helper.confirm_demo = lambda origin, request, folder, agent: (self.asked.append((origin, request, folder, agent)), allow)[1]
         self.helper.demo_root = root / "Demos"
-        patch = mock.patch.object(demo, "find_claude", return_value=str(script))
-        patch.start()
-        self.addCleanup(patch.stop)
+        self._only_agents(**{name: str(fakes[name](recording, error=error)) for name in agents})
         return recording, app
 
     def _wait(self, job_id):
@@ -1126,7 +1157,7 @@ class TestServeHelper(unittest.TestCase):
         root = Path(self.tmp.name)
         self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
         self.assertTrue((root / "prompt.txt").read_text().startswith("/record-demo profile settings"))
-        self.assertEqual(self.asked[0][0], self.ORIGIN)
+        self.assertEqual((self.asked[0][0], self.asked[0][3]), (self.ORIGIN, "Claude Code"))
         with mock.patch.object(self.serve.subprocess, "run") as run, \
                 mock.patch.object(self.serve.platform, "system", return_value="Darwin"):
             self.assertEqual(self.call("POST", "/reveal", {"path": str(recording)})[0], 200)
@@ -1135,8 +1166,11 @@ class TestServeHelper(unittest.TestCase):
     def test_demo_needs_allow_setup_and_pairing(self):
         self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"}, token=None)[0], 401)
         self.helper.confirm_demo = lambda *a: self.fail("asked before setup")
-        with mock.patch("reelforge.demo.find_claude", return_value="/bin/echo"):
-            status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
+        self._only_agents()
+        status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
+        self.assertEqual((status, body["error"]), (409, "neither Claude Code nor Codex is installed on this Mac"))
+        self._only_agents(claude="/bin/echo")
+        status, body, _ = self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})
         self.assertEqual((status, body["error"]), (409, "choose the app folder first"))
         self._demo_ready(allow=False)
         self.assertEqual(self.call("POST", "/demo", {"feature": "abc", "url": "https://a.dev"})[0], 403)
@@ -1147,6 +1181,86 @@ class TestServeHelper(unittest.TestCase):
         self._demo_ready(error=True)
         _, view, _ = self.call("POST", "/demo", {"feature": "abc def", "url": "https://a.dev"})
         self.assertEqual(self._wait(view["id"])["status"], "failed")
+
+    def test_demo_runs_codex_when_it_is_the_only_agent(self):
+        recording, app = self._demo_ready(agents=("codex",))
+        _, health, _ = self.call("GET", "/health", token=None)
+        self.assertEqual((health["demo"]["claude"], health["demo"]["codex"], health["demo"]["agent"], health["demo"]["ready"]),
+                         (False, True, "codex", True))
+        status, view, _ = self.call("POST", "/demo", {"feature": "profile settings", "url": "http://localhost:7777"})
+        self.assertEqual(status, 200, view)
+        done = self._wait(view["id"])
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["result"]["out"], str(recording))
+        self.assertEqual(done["result"]["agent"], "codex")
+        self.assertEqual(done["result"]["report"][0], "ENGINE: ffmpeg + format=walkthrough")
+        self.assertEqual(done["log"][:2], ["Writing the storyboard.", "· Shell: node capture.cjs"])
+        root = Path(self.tmp.name)
+        args = (root / "args.txt").read_text().splitlines()
+        self.assertEqual(args[:4], ["exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"])
+        self.assertEqual(args[4], "$lilo-record-demo profile settings format=walkthrough")
+        self.assertEqual(Path((root / "cwd.txt").read_text().strip()).resolve(), app.resolve())
+        self.assertEqual(self.asked[0][3], "Codex")
+
+    def test_codex_must_be_signed_in_and_the_page_can_open_its_sign_in(self):
+        self._demo_ready(agents=("codex",))
+        self.signed_in = False
+        _, health, _ = self.call("GET", "/health", token=None)
+        self.assertEqual((health["demo"]["codex_signed_in"], health["demo"]["ready"]), (False, False))
+        status, body, _ = self.call("POST", "/demo", {"feature": "abc def", "url": "https://a.dev"})
+        self.assertEqual((status, body["error"], self.asked), (409, "sign in to Codex first", []))
+        self.assertEqual(self.call("POST", "/demo/codex-login", {}, token=None)[0], 401)
+        with mock.patch.object(self.serve.subprocess, "Popen") as popen:
+            popen.return_value.wait.side_effect = self.serve.subprocess.TimeoutExpired("codex", 2)
+            self.assertEqual(self.call("POST", "/demo/codex-login", {})[0], 200)
+            self.assertEqual(popen.call_args[0][0][1:], ["login"])
+            popen.return_value.wait.side_effect = None
+            popen.return_value.wait.return_value = 1
+            status, body, _ = self.call("POST", "/demo/codex-login", {})
+            self.assertEqual(status, 502)
+            self.assertIn("codex login", body["error"])
+        self._only_agents(claude="/bin/echo")
+        self.assertEqual(self.call("POST", "/demo/codex-login", {})[0], 409)
+
+    def test_the_page_can_install_codex_with_a_fixed_command(self):
+        from reelforge import demo
+        self._only_agents()
+        self.assertEqual(self.call("POST", "/demo/codex-install", {}, token=None)[0], 401)
+        with mock.patch.object(demo, "codex_install_argv", return_value=None):
+            self.assertEqual(self.call("POST", "/demo/codex-install", {})[0], 409)
+        with mock.patch.object(demo, "codex_install_argv", return_value=["/bin/echo", "installed"]):
+            status, view, _ = self.call("POST", "/demo/codex-install", {"argv": ["rm", "-rf", "/"]})
+        self.assertEqual(status, 200, view)
+        done = self._wait(view["id"])
+        self.assertEqual((done["status"], done["log"]), ("done", ["installed"]))
+        with mock.patch.object(demo, "_find", return_value="/opt/homebrew/bin/brew"):
+            self.assertEqual(demo.codex_install_argv(), ["/opt/homebrew/bin/brew", "install", "--cask", "codex"])
+        self._only_agents(codex="/bin/echo")
+        self.assertEqual(self.call("POST", "/demo/codex-install", {})[0], 409)
+
+    def test_demo_that_codex_reports_as_failed_is_failed(self):
+        self._demo_ready(error=True, agents=("codex",))
+        _, view, _ = self.call("POST", "/demo", {"feature": "abc def", "url": "https://a.dev"})
+        done = self._wait(view["id"])
+        self.assertEqual((done["status"], done["result"]["report"]), ("failed", ["usage limit reached"]))
+
+    def test_demo_agent_is_chosen_on_this_mac_from_what_is_installed(self):
+        from reelforge import demo
+        self._demo_ready(agents=("claude", "codex"))
+        _, health, _ = self.call("GET", "/health", token=None)
+        self.assertEqual(health["demo"]["agent"], "claude")
+        self.assertEqual(self.call("POST", "/demo/agent", {"agent": "codex"}, token=None)[0], 401)
+        status, body, _ = self.call("POST", "/demo/agent", {"agent": "codex"})
+        self.assertEqual((status, body["agent"]), (200, "codex"))
+        self.assertEqual(self.call("POST", "/demo/agent", {"agent": "/bin/sh"})[0], 400)
+        self._only_agents(claude="/bin/echo")
+        self.assertEqual(self.call("POST", "/demo/agent", {"agent": "codex"})[0], 400)
+        self.assertEqual(demo.status(self.helper.state_dir)["agent"], "claude")
+        demo.change_config(self.helper.state_dir, dir="/somewhere")
+        self.assertEqual(demo.load_config(self.helper.state_dir)["agent"], "codex")
+        self.assertFalse((self.helper.state_dir / "demo.json.new").exists())
+        self.assertEqual(demo.codex_command_of({"codex_command": "$my-skill"}), "$my-skill")
+        self.assertEqual(demo.codex_command_of({"codex_command": "; rm -rf /"}), "$lilo-record-demo")
 
     def test_health_says_whether_demos_can_run(self):
         _, body, _ = self.call("GET", "/health", token=None)
