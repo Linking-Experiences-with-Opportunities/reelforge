@@ -16,10 +16,8 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import re
 import secrets
-import signal
 import subprocess
 import sys
 import threading
@@ -31,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from . import demo as demo_mod
+from . import native
 from . import recipe as recipe_mod
 from .render import IMAGE_SUFFIXES, VIDEO_SUFFIXES
 from .shell import have
@@ -38,7 +37,7 @@ from .shell import have
 DEFAULT_PORT = 47821
 DEFAULT_ORIGINS = ("https://marketing.pathion.dev",)
 STATE_DIR = Path.home() / ".reelforge"
-OUTPUT_DIR = Path.home() / "Movies" / "Reelforge"
+OUTPUT_DIR = native.default_output_dir()
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".aif", ".aiff"}
 BROWSERS = {"safari", "chrome", "firefox", "edge", "brave"}
 FITS = {"cover", "contain", "blur"}
@@ -156,7 +155,7 @@ def render_args(body: dict, projects: Path, out_dir: Path, stamp: str) -> tuple[
 def _existing(paths: list[str], label: str) -> list[str]:
     for path in paths:
         if path.startswith("-") or not Path(path).exists():
-            raise ApiError(400, f"{label}: {Path(path).name} is not on this Mac")
+            raise ApiError(400, f"{label}: {Path(path).name} is not on {native.MACHINE}")
     return paths
 
 
@@ -266,10 +265,14 @@ CODEX_LOGIN_GRACE = 2.0  # seconds a sign-in must survive before the page is tol
 
 class Job:
     def __init__(self, kind: str, args: list[str], result: dict | None = None, *,
-                 argv: list[str] | None = None, cwd: Path | None = None, parse=None):
+                 argv: list[str] | None = None, cwd: Path | None = None, parse=None,
+                 stdin_text: str | None = None):
         self.argv = argv  # a whole command instead of `python -m reelforge <args>`
         self.cwd = cwd
         self.parse = parse  # raw output line -> (lines to show, result fields)
+        # A prompt goes in on stdin, never on the command line: on Windows the agents
+        # are .cmd shims, and cmd.exe would read & | < > in the prompt as its own syntax.
+        self.stdin_text = stdin_text
         self.id = uuid.uuid4().hex[:12]
         self.kind = kind
         self.args = args
@@ -281,15 +284,26 @@ class Job:
         self.lock = threading.Lock()
 
     def start(self) -> None:
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        # UTF-8 both ways: the agents read and write it, and Windows would otherwise use its code page.
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         self.proc = subprocess.Popen(
             self.argv or [sys.executable, "-m", "reelforge", *self.args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, env=env, text=True, errors="replace",
+            stdin=subprocess.DEVNULL if self.stdin_text is None else subprocess.PIPE, env=env, text=True, encoding="utf-8", errors="replace",
             cwd=str(self.cwd) if self.cwd else None,
-            start_new_session=self.argv is not None,  # so cancel reaches what it started
+            **(native.group_kwargs() if self.argv is not None else native.hidden_kwargs()),
         )
+        if self.stdin_text is not None:
+            threading.Thread(target=self._feed, daemon=True).start()
         threading.Thread(target=self._pump, daemon=True).start()
+
+    def _feed(self) -> None:
+        assert self.proc and self.proc.stdin
+        try:
+            self.proc.stdin.write(self.stdin_text or "")
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
     def _pump(self) -> None:
         assert self.proc and self.proc.stdout
@@ -324,10 +338,7 @@ class Job:
                 return
             self.status = "cancelled"
         if self.proc and self.argv is not None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+            native.kill_tree(self.proc)
         elif self.proc:
             self.proc.terminate()
 
@@ -341,19 +352,8 @@ class Job:
 
 
 # --------------------------------------------------------------------------- #
-# native dialogs (macOS)
+# native dialogs (see native.py for the macOS and Windows versions)
 # --------------------------------------------------------------------------- #
-
-def _osascript(script: str, timeout: float = 600) -> tuple[int, str]:
-    if platform.system() != "Darwin":
-        raise ApiError(501, "file pickers are only built for macOS so far")
-    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
-    return proc.returncode, proc.stdout.strip()
-
-
-def _quote(text: str) -> str:
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
 
 PICK_KINDS = {
     "folder": (None, False),
@@ -370,54 +370,31 @@ def pick(kind: str, prompt: str) -> list[str]:
     if kind not in PICK_KINDS:
         raise ApiError(400, f"unknown picker: {kind}")
     suffixes, multiple = PICK_KINDS[kind]
-    prompt = _quote(prompt[:120] or "Choose")
-    if suffixes is None:
-        script = f'tell me to activate\nreturn POSIX path of (choose folder with prompt {prompt})'
-    else:
-        types = "{" + ", ".join(_quote(s.lstrip(".")) for s in sorted(suffixes)) + "}"
-        many = " with multiple selections allowed" if multiple else ""
-        script = (
-            "tell me to activate\n"
-            f"set picked to choose file with prompt {prompt} of type {types}{many}\n"
-            "if class of picked is not list then set picked to {picked}\n"
-            'set out to ""\n'
-            "repeat with f in picked\n"
-            "set out to out & POSIX path of f & linefeed\n"
-            "end repeat\n"
-            "return out"
-        )
-    code, out = _osascript(script)
-    if code != 0:
-        return []  # the person pressed Cancel
-    return [line for line in out.splitlines() if line.strip()]
+    try:
+        return native.pick(suffixes, multiple, prompt)
+    except native.NativeError as exc:
+        raise ApiError(501, str(exc)) from exc
+
+
+def _confirm(title: str, text: str, *, default_allow: bool) -> bool:
+    try:
+        return native.confirm(title, text, default_allow=default_allow)
+    except native.NativeError as exc:
+        raise ApiError(501, str(exc)) from exc
 
 
 def ask_to_pair(origin: str) -> bool:
-    text = (f"Allow {origin} to use Reelforge on this Mac?\\n\\n"
-            "It will be able to read the videos you pick and save new ones to Movies/Reelforge.")
-    script = (
-        "tell me to activate\n"
-        f'set answer to display dialog "{text}" with title "Reelforge" '
-        'buttons {"Don\'t Allow", "Allow"} default button "Allow" giving up after 120\n'
-        "return button returned of answer"
-    )
-    code, out = _osascript(script, timeout=150)
-    return code == 0 and out == "Allow"
+    text = (f"Allow {origin} to use Reelforge on {native.MACHINE}?\n\n"
+            f"It will be able to read the videos you pick and save new ones to {OUTPUT_DIR.parent.name}/Reelforge.")
+    return _confirm("Reelforge", text, default_allow=True)
 
 
 def ask_to_record(origin: str, request: dict, folder: Path, agent: str = "Claude Code") -> bool:
     """Every demo recording starts a coding agent with full access, so the person approves each one."""
-    text = (f"Let {agent} record a demo on this Mac?\n\nAsked by: {origin}\nShow: {request['feature']}\n"
+    text = (f"Let {agent} record a demo on {native.MACHINE}?\n\nAsked by: {origin}\nShow: {request['feature']}\n"
             f"On: {request['url']}\nWorking in: {folder}\n\n"
-            f"{agent} will run on its own, with full access to this Mac, until the video is made.")
-    script = (
-        "tell me to activate\n"
-        f"set answer to display dialog {_quote(text)} with title \"Demo recorder\" "
-        'buttons {"Don\'t Allow", "Allow"} default button "Don\'t Allow" giving up after 120\n'
-        "return button returned of answer"
-    )
-    code, out = _osascript(script, timeout=150)
-    return code == 0 and out == "Allow"
+            f"{agent} will run on its own, with full access to {native.MACHINE}, until the video is made.")
+    return _confirm("Demo recorder", text, default_allow=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -478,7 +455,7 @@ class Helper:
     def health(self) -> dict:
         tools = tool_status()
         return {
-            "ok": True, "version": __version__, "platform": platform.system(),
+            "ok": True, "version": __version__, "platform": native.SYSTEM, "machine": native.MACHINE,
             "tools": tools, "ready": tools["ffmpeg"] and tools["ffprobe"],
             "projects_dir": str(self.projects), "output_dir": str(self.out_dir),
             "demo": demo_mod.status(self.state_dir),
@@ -531,26 +508,26 @@ class Helper:
         installed, folder = demo_mod.find_agents(), demo_mod.folder_of(config)
         agent = demo_mod.agent_of(config, installed)
         if not agent:
-            raise ApiError(409, "neither Claude Code nor Codex is installed on this Mac")
+            raise ApiError(409, "neither Claude Code nor Codex is installed on " + native.MACHINE)
         if agent == "codex" and not demo_mod.codex_signed_in(installed[agent], fresh=True):
             raise ApiError(409, "sign in to Codex first")
         if not folder:
             raise ApiError(409, "choose the app folder first")
         if not self.demo_lock.acquire(blocking=False):
-            raise ApiError(409, "a demo request is already waiting on this Mac")
+            raise ApiError(409, f"a demo request is already waiting on {native.MACHINE}")
         try:
             if any(j.kind == "demo" and j.status == "running" for j in self.jobs.values()):
                 raise ApiError(409, "a demo is already being recorded")
-            if not self.confirm_demo(origin or "this Mac", request, folder, demo_mod.AGENT_NAMES[agent]):
+            if not self.confirm_demo(origin or native.MACHINE, request, folder, demo_mod.AGENT_NAMES[agent]):
                 raise ApiError(403, "the recording was not allowed")
             if agent == "codex":
                 prompt = demo_mod.demo_prompt(request, demo_mod.codex_command_of(config))
-                argv, parse = demo_mod.codex_argv(installed[agent], prompt), demo_mod.parse_codex_line
+                argv, parse = demo_mod.codex_argv(installed[agent]), demo_mod.parse_codex_line
             else:
                 prompt = demo_mod.demo_prompt(request, demo_mod.command_of(config))
-                argv, parse = demo_mod.demo_argv(installed[agent], prompt), demo_mod.parse_line
+                argv, parse = demo_mod.demo_argv(installed[agent]), demo_mod.parse_line
             return self.start_job("demo", [], {"feature": request["feature"], "url": request["url"], "agent": agent},
-                                  argv=argv, cwd=folder, parse=parse)
+                                  argv=argv, cwd=folder, parse=parse, stdin_text=prompt)
         finally:
             self.demo_lock.release()
 
@@ -558,18 +535,18 @@ class Helper:
         """Which installed agent records. The page may switch between the two; it cannot name a command."""
         agent = body.get("agent")
         if agent not in demo_mod.find_agents():
-            raise ApiError(400, "that is not installed on this Mac")
+            raise ApiError(400, "that is not installed on " + native.MACHINE)
         demo_mod.change_config(self.state_dir, agent=agent)
         return demo_mod.status(self.state_dir)
 
     def install_codex(self) -> dict:
-        """Installs Codex with Homebrew, as a job the page can follow. A fixed command; the page sends nothing."""
+        """Installs Codex (Homebrew on a Mac, npm on Windows) as a job the page can follow. A fixed command; the page sends nothing."""
         if demo_mod.find_codex():
-            raise ApiError(409, "Codex is already installed on this Mac")
+            raise ApiError(409, "Codex is already installed on " + native.MACHINE)
         argv = demo_mod.codex_install_argv()
         if not argv:
-            raise ApiError(409, "Homebrew is not on this Mac, so Codex has to be installed by hand")
-        # Checked and started under one lock, so a double click cannot start Homebrew twice.
+            raise ApiError(409, f"{demo_mod.INSTALLER_NAME} is not on {native.MACHINE}, so Codex has to be installed by hand")
+        # Checked and started under one lock, so a double click cannot start the installer twice.
         with self.setup_lock:
             if any(j.kind == "codex-install" and j.status == "running" for j in self.jobs.values()):
                 raise ApiError(409, "Codex is already being installed")
@@ -579,12 +556,13 @@ class Helper:
         """Opens Codex's own sign-in page in the browser. The person signs in there; nothing passes through the page."""
         codex = demo_mod.find_codex()
         if not codex:
-            raise ApiError(409, "Codex is not installed on this Mac")
+            raise ApiError(409, "Codex is not installed on " + native.MACHINE)
         with self.setup_lock:
             if self.codex_login_proc and self.codex_login_proc.poll() is None:
                 self.codex_login_proc.terminate()
             proc = self.codex_login_proc = subprocess.Popen(
-                [codex, "login"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                [codex, "login"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **native.hidden_kwargs())
         # A sign-in that works keeps running until the browser comes back. One that stops
         # straight away failed; its output is not read, since it can carry sign-in links.
         try:
@@ -592,14 +570,14 @@ class Helper:
         except subprocess.TimeoutExpired:
             return {"ok": True}
         if code != 0:
-            raise ApiError(502, "Codex could not open its sign-in page. Open Terminal, type codex login, and press Return.")
+            raise ApiError(502, f"Codex could not open its sign-in page. Open {native.TERMINAL}, type codex login, and press {native.ENTER_KEY}.")
         return {"ok": True}
 
     def choose_demo_dir(self) -> dict:
         """The folder the agent works in is picked in a native dialog, never sent by the page."""
         picked = pick("folder", "Choose the app folder to record from")
         if picked:
-            demo_mod.change_config(self.state_dir, dir=picked[0].rstrip("/"))
+            demo_mod.change_config(self.state_dir, dir=native.clean_folder(picked[0]))
         return demo_mod.status(self.state_dir)
 
     def start_job(self, kind: str, args: list[str], result: dict | None = None, **how) -> dict:
@@ -613,9 +591,10 @@ class Helper:
         allowed = (self.out_dir.resolve(), self.projects.resolve(), self.demo_root.resolve())
         if not path.exists() or not any(root == path or root in path.parents for root in allowed):
             raise ApiError(400, "only files reelforge made can be opened from the page")
-        if platform.system() != "Darwin":
-            raise ApiError(501, "opening files is only built for macOS so far")
-        subprocess.run(["open", str(path)] if open_it else ["open", "-R", str(path)], check=False)
+        try:
+            native.reveal(path, open_it=open_it)
+        except native.NativeError as exc:
+            raise ApiError(501, str(exc)) from exc
         return {"ok": True}
 
     def pair(self, origin: str | None) -> dict:
