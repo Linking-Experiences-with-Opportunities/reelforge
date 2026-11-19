@@ -382,7 +382,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
             sync_mod.mux(r, out, bitrate=args.bitrate,
                          keep_camera_gaps=not args.no_camera_fill)
             muxed += 1
-        _print(f"-> {muxed} synced video(s) in {out_dir}" if muxed
+        unmatched = sum(1 for r in results if r.take is None)
+        if not muxed and unmatched == len(results):
+            raise ToolError("no camera video matched a take; check that they are "
+                            "from the same recording")
+        missed = f" ({unmatched} had no match)" if unmatched else ""
+        _print(f"-> {muxed} synced video(s){missed} in {out_dir}" if muxed
                else "-> nothing muxed (no matched file had a video stream)")
     return 0
 
