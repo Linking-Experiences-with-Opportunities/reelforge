@@ -395,6 +395,7 @@ reelforge/
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   speakers.py   speaker labels from per-mic tracks, voice split for shared mics
   serve.py      local helper a web page drives (loopback only, paired)
+  native.py     dialogs, file pickers, open/reveal, stopping a job (macOS + Windows)
   cli.py        argparse front end
 tools/
   make_fixture.py   synthetic test reel generator
@@ -407,31 +408,54 @@ out, so a web front end can sit on top of the same calls later.
 
 ## Use it from a web page (no terminal)
 
-For teammates who should never see a command line. One paste, once (macOS):
+For teammates who should never see a command line. One paste, once.
+
+macOS, in Terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Linking-Experiences-with-Opportunities/reelforge/main/install.sh | bash
+```
+
+Windows 10 or 11, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Linking-Experiences-with-Opportunities/reelforge/main/install.ps1 | iex
 ```
 
 That installs Homebrew if it is missing, ffmpeg, yt-dlp, tesseract, whisper and
 reelforge, then starts `reelforge serve` and keeps it running across restarts
 (launchd agent `dev.pathion.reelforge-helper`, log in `~/.reelforge/helper.log`).
 The Tools tab on marketing.pathion.dev then drives it: study a reel, edit the
-words, pick footage with the normal macOS file window, make the video. Renders
-land in `~/Movies/Reelforge`. Footage never leaves the computer.
+words, pick footage with the normal file window, make the video. Renders
+land in `~/Movies/Reelforge` (`Videos\Reelforge` on Windows). Footage never leaves the computer.
+
+On Windows, `install.ps1` uses winget for ffmpeg, yt-dlp, git, uv and Tesseract
+(the Tesseract installer is the one step that may ask for permission), installs
+reelforge with uv into `~\.reelforge\src`, and writes `~\.reelforge\run-helper.ps1`:
+a loop that pulls, runs the helper, and starts it again when it exits. A shortcut
+in the Startup folder runs that loop at sign-in through `conhost --headless`, so
+no window shows (Windows Terminal ignores `-WindowStyle Hidden`). No scheduled
+task and no administrator rights. The dialogs and file pickers are Windows Forms
+driven from PowerShell (`reelforge/native.py`); page text reaches them only
+through environment variables, never as script source.
 
 `reelforge serve` listens on `127.0.0.1:47821` only, and answers:
 
 - only requests whose `Host` is that loopback address (no DNS rebinding);
 - only pages on its allow list (`--allow-origin`, default marketing.pathion.dev);
 - only with the pairing token, which a page gets after the person clicks
-  **Allow** in a dialog on their Mac (`/health` and `/pair` are the exceptions).
+  **Allow** in a dialog on their computer (`/health` and `/pair` are the exceptions).
 
 Each job is the ordinary CLI run as a subprocess, so the page and the terminal
 behave the same. The helper pulls `main` each time it starts; the page's
 restart call (`POST /restart`) is how an update is picked up without a reboot.
-Windows is not built yet: the installer, the file windows and the start-at-login
-piece are macOS only.
+
+The demo recorder starts Claude Code or Codex with the prompt on **stdin**, not
+on the command line: on Windows both are usually npm `.cmd` shims, and cmd.exe
+would read `&`, `|`, `<`, `>` or a line break in a prompt as its own syntax.
+Cancelling a job stops its whole process tree (`killpg` on macOS, `taskkill /T`
+on Windows). On Windows the page installs Codex with `npm install --global
+@openai/codex`, so it needs Node.js; on a Mac it uses Homebrew.
 
 The same page also runs three footage tools through the helper, each the ordinary CLI:
 
@@ -476,7 +500,7 @@ the rest:
 - with both agents installed Claude Code is used, until `POST /demo/agent {"agent": "codex"}`
   (or `"claude"`) says otherwise. Only an agent that is installed can be chosen;
 - Codex can be set up from the page with two fixed commands: `POST /demo/codex-install` runs
-  `brew install --cask codex` as a job, and `POST /demo/codex-login` opens Codex's own sign-in
+  `brew install --cask codex` (on Windows `npm install --global @openai/codex`) as a job, and `POST /demo/codex-login` opens Codex's own sign-in
   page in the browser. A recording with Codex is refused until `codex login status` says it is
   signed in;
 - only `https` sites, or `http` on localhost, and one recording at a time.
