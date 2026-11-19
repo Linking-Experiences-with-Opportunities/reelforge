@@ -765,8 +765,147 @@ class TestSpeakers(unittest.TestCase):
         self.assertEqual(labels[20:], [0] * 8)
 
 
+
+class TestReviewFixes(unittest.TestCase):
+    def test_split_turns_cuts_at_sentences_and_pauses(self):
+        from reelforge.cli import split_turns
+        w = lambda t, a, b: {"word": t, "start": a, "end": b}
+        seg = {"start": 0, "end": 5, "text": "x", "words": [
+            w(" How", 0, .3), w(" was", .3, .5), w(" it?", .5, .8),
+            w(" Great", 1.0, 1.3), w(" really", 1.3, 1.6), w(" and", 2.6, 2.8), w(" fun", 2.8, 3.0)]}
+        got = split_turns([seg, {"start": 9, "end": 10, "text": "no words"}])
+        self.assertEqual([g["text"] for g in got], ["How was it?", "Great really", "and fun", "no words"])
+        self.assertEqual((got[1]["start"], got[1]["end"]), (1.0, 1.6))
+
+    def test_fresh_dir_never_reuses_a_folder(self):
+        import tempfile
+        from reelforge.serve import fresh_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = fresh_dir(Path(tmp) / "Sync", "s"), fresh_dir(Path(tmp) / "Sync", "s")
+            self.assertEqual((a.name, b.name), ("s", "s-2"))
+            self.assertTrue(a.is_dir() and b.is_dir())
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCameraMatch(unittest.TestCase):
+    """Camera matching corrects per camera, never per clip."""
+
+    def setUp(self):
+        from reelforge import match
+        self.match = match
+
+    def clip(self, cam, name, stats):
+        c = self.match.Clip(cam, Path(name))
+        c.stats = self.match.Stats(*stats)
+        return c
+
+    def test_reference_camera_is_left_alone(self):
+        clips = [self.clip("sony", "a.mp4", (20, 110, 200, 80, 128, 128)),
+                 self.clip("sony", "b.mp4", (30, 90, 180, 20, 128, 128)),
+                 self.clip("phone", "c.mp4", (20, 80, 150, 50, 131, 125))]
+        plan = self.match.make_plan(clips, "sony")
+        self.assertEqual(plan.filter_for(clips[0]), "")
+        self.assertEqual(plan.filter_for(clips[1]), "")
+
+    def test_every_clip_from_a_camera_gets_the_same_correction(self):
+        clips = [self.clip("sony", "a.mp4", (28, 110, 195, 84, 130, 127)),
+                 self.clip("phone", "c.mp4", (32, 99, 178, 75, 129, 125)),
+                 self.clip("phone", "d.mp4", (16, 75, 147, 36, 134, 125))]
+        plan = self.match.make_plan(clips, "sony")
+        first, second = plan.filter_for(clips[1]), plan.filter_for(clips[2])
+        self.assertEqual(first, second)
+        self.assertIn("eq=contrast=", first)
+        self.assertIn("saturation=", first)
+
+    def test_corrections_are_clamped(self):
+        clips = [self.clip("sony", "a.mp4", (0, 128, 255, 100, 128, 128)),
+                 self.clip("phone", "c.mp4", (100, 110, 120, 10, 128, 128))]
+        vf = self.match.make_plan(clips, "sony").filter_for(clips[1])
+        self.assertIn(f"contrast={self.match.MAX_GAIN:.4f}", vf)
+        self.assertIn(f"saturation={self.match.MAX_SAT:.3f}", vf)
+
+    def test_unknown_reference_is_an_error(self):
+        clips = [self.clip("sony", "a.mp4", (0, 128, 255, 100, 128, 128))]
+        from reelforge.shell import ToolError
+        with self.assertRaises(ToolError):
+            self.match.make_plan(clips, "gopro")
+
+    def test_signalstats_parsing_and_plain_words(self):
+        text = ("lavfi.signalstats.YLOW=20\nlavfi.signalstats.YAVG=100.5\nlavfi.signalstats.YHIGH=200\n"
+                "lavfi.signalstats.SATAVG=40\nlavfi.signalstats.UAVG=126\nlavfi.signalstats.VAVG=131\n")
+        stats = self.match.parse_signalstats(text)
+        self.assertEqual((stats.ylow, stats.yavg, stats.u, stats.v), (20, 100.5, 126, 131))
+        self.assertIsNone(self.match.parse_signalstats("nothing here"))
+        self.assertEqual(self.match.describe(""), "no change")
+        self.assertEqual(self.match.describe("eq=contrast=1.1:brightness=0.0800:saturation=1.300,colorbalance=rm=0.020:bm=-0.010"),
+                         "brighter, more colour, warmer")
+
+
+class TestHelperToolArgs(unittest.TestCase):
+    """What the page may ask the helper to run for podcast sync, speaker labels and camera matching."""
+
+    def setUp(self):
+        from reelforge import serve
+        self.serve = serve
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        for name in ("a.mp4", "b.mp4", "take.wav", "mic1.wav", "mic2.wav"):
+            (self.root / name).write_bytes(b"x")
+        self.out = self.root / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def f(self, name):
+        return str(self.root / name)
+
+    def test_sync_args(self):
+        args = self.serve.sync_args({"videos": [self.f("a.mp4")], "takes": [self.f("take.wav")]}, self.out)
+        self.assertEqual(args[:5], ["sync", "--videos", self.f("a.mp4"), "--takes", self.f("take.wav")])
+        self.assertIn(str(self.out / "sync-report.json"), args)
+        with self.assertRaises(self.serve.ApiError):
+            self.serve.sync_args({"videos": [self.f("a.mp4")]}, self.out)
+        with self.assertRaises(self.serve.ApiError):
+            self.serve.sync_args({"videos": [self.f("gone.mp4")], "takes": [self.f("take.wav")]}, self.out)
+        with self.assertRaises(self.serve.ApiError):
+            self.serve.sync_args({"videos": ["--out-dir"], "takes": [self.f("take.wav")]}, self.out)
+
+    def test_speakers_args(self):
+        body = {"take": self.f("take.wav"), "mics": [{"name": "Max", "path": self.f("mic1.wav")},
+                                                     {"name": "Brian", "path": self.f("mic2.wav")}]}
+        args = self.serve.speakers_args(body, self.out)
+        self.assertEqual(args[:3], ["speakers", "--take", self.f("take.wav")])
+        self.assertIn(f"Max={self.f('mic1.wav')}", args)
+        for bad in ({"take": self.f("take.wav"), "mics": []},
+                    {"take": self.f("take.wav"), "mics": [{"name": "A=B", "path": self.f("mic1.wav")}]},
+                    {"take": self.f("take.wav"), "mics": [{"name": "A/B", "path": self.f("mic1.wav")}]},
+                    {"take": self.f("take.wav"), "mics": [{"name": "Max", "path": self.f("mic1.wav")},
+                                                          {"name": "max", "path": self.f("mic2.wav")}]},
+                    {"mics": body["mics"]}):
+            with self.assertRaises(self.serve.ApiError):
+                self.serve.speakers_args(bad, self.out)
+
+    def test_match_args(self):
+        body = {"cameras": [{"name": "Sony", "paths": [self.f("a.mp4")]},
+                            {"name": "Phone", "paths": [self.f("b.mp4")]}], "ref": "Phone", "smooth": 0.5}
+        args = self.serve.match_args(body, self.out)
+        self.assertEqual(args[:6], ["match", "--camera", "Sony", self.f("a.mp4"), "--camera", "Phone"])
+        self.assertEqual(args[args.index("--ref") + 1], "Phone")
+        self.assertEqual(args[args.index("--smooth") + 1], "0.50")
+        for bad in ({"cameras": body["cameras"][:1]},
+                    {"cameras": body["cameras"], "ref": "GoPro"},
+                    {"cameras": body["cameras"], "smooth": 3},
+                    {"cameras": [{"name": "--ref", "paths": [self.f("a.mp4")]}, body["cameras"][1]]},
+                    {"cameras": [{"name": "Sony", "paths": []}, body["cameras"][1]]}):
+            with self.assertRaises(self.serve.ApiError):
+                self.serve.match_args(bad, self.out)
+
+    def test_match_cli_parses_cameras(self):
+        from reelforge import cli
+        args = cli.build_parser().parse_args(["match", "--camera", "sony", "a.mp4", "b.mp4", "--camera", "phone", "c/"])
+        self.assertEqual(args.camera, [["sony", "a.mp4", "b.mp4"], ["phone", "c/"]])
 
 
 class TestServeHelper(unittest.TestCase):
@@ -824,6 +963,15 @@ class TestServeHelper(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["version"], self.serve.__version__)
         self.assertEqual(res.getheader("Access-Control-Allow-Origin"), self.ORIGIN)
+
+    def test_health_lists_the_tools_and_a_bad_request_starts_nothing(self):
+        self.assertEqual(self.call("GET", "/health", token=None)[1]["features"], ["sync", "speakers", "match"])
+        status, body, _ = self.call("POST", "/match", {"cameras": []})
+        self.assertEqual(status, 400)
+        self.assertIn("two cameras", body["error"])
+        self.assertEqual(self.call("POST", "/sync", {}, token=None)[0], 401)
+        self.assertFalse((self.helper.out_dir / "Camera matching").exists())
+        self.assertEqual(self.helper.jobs, {})
 
     def test_other_sites_and_rebound_hosts_are_refused(self):
         self.assertEqual(self.call("GET", "/health", origin="https://evil.example")[0], 403)

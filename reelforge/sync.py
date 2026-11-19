@@ -378,4 +378,5 @@ def mux(match: Match, out_path: Path, *, bitrate: str = "192k",
 
 
 def write_report(results: list[Match], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([asdict(r) for r in results], indent=2) + "\n", "utf-8")
