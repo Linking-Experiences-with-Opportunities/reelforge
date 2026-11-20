@@ -95,8 +95,13 @@ def shot_lengths_from_cuts(cuts: list[float], duration: float) -> list[float]:
     ]
 
 
-def audio_envelope(video: Path, has_audio: bool) -> tuple[list[float], list[float], float | None]:
-    """Return (rms_envelope, onset_times, tempo_bpm)."""
+def audio_envelope(video: Path, has_audio: bool, hop_seconds: float = HOP_SECONDS,
+                   ) -> tuple[list[float], list[float], float | None]:
+    """Return (rms_envelope, onset_times, tempo_bpm).
+
+    `hop_seconds` is the envelope resolution; beat tracking wants a finer one
+    (10 ms) than the shot-level energy summary in a recipe needs.
+    """
     if not has_audio:
         return [], [], None
 
@@ -115,7 +120,7 @@ def audio_envelope(video: Path, has_audio: bool) -> tuple[list[float], list[floa
     samples = array.array("h")
     samples.frombytes(raw)
 
-    hop = int(AUDIO_RATE * HOP_SECONDS)
+    hop = max(1, int(AUDIO_RATE * hop_seconds))
     envelope: list[float] = []
     for start in range(0, len(samples) - hop + 1, hop):
         window = samples[start:start + hop]
@@ -130,7 +135,7 @@ def audio_envelope(video: Path, has_audio: bool) -> tuple[list[float], list[floa
     peak = max(envelope) or 1.0
     envelope = [round(v / peak, 5) for v in envelope]
 
-    onsets = _detect_onsets(envelope, HOP_SECONDS)
+    onsets = _detect_onsets(envelope, hop_seconds)
     tempo = _estimate_tempo(onsets)
     return envelope, onsets, tempo
 
