@@ -168,6 +168,56 @@ error: this recipe needs 2 image/diagram(s); you supplied 1.
 reelforge make ./some-reel.mp4 --clips ./my-footage --assets a.png b.png --out out.mp4
 ```
 
+### Beat-synced edits (AMVs, fan edits, montages)
+
+Two ways to get the cut timing:
+
+```bash
+# copy an edit that already works (fast cuts need a lower minimum shot length)
+reelforge ingest "https://www.tiktok.com/@someone/video/..." --min-shot 0.15 --scene-threshold 0.2
+
+# or start from the song alone: a cut every 2 beats from the drop at 0:42, 15 s long
+reelforge beats song.mp3 --every 2 --start 0:42 --duration 15
+```
+
+`beats` finds the beat grid, starts the video on a beat, ends it on a beat, and
+puts `flash,shake` on the first cut of each bar and `zoom` on the others
+(`--effects`, `--accent`, `none` to turn either off). `--every 1` cuts every
+beat, `4` every bar, `0.5` every half beat. If the tempo comes out half or
+double, pass `--bpm`. If the accents land on the wrong beat, try `--bar-offset 1`–`3`.
+
+Then say which clip goes where, and from which moment, in a **shot list** - one
+line per cut, in order:
+
+```
+# clip            in-point   effects       speed
+gojo-domain.mp4   0:03.2     zoom flash
+sukuna.mov        12.5       shake         0.5x
+toji.mp4                     -                       # '-' = no effects
+...                                                  # leave this cut as the recipe has it
+```
+
+```bash
+reelforge render --recipe ~/reelforge-projects/song-beats/recipe.json \
+  --clips ~/Movies/amv/clips --shots shots.txt --out edit.mp4
+```
+
+Clip names are looked up next to the shot list, then in the `--clips` folders.
+Cuts the list doesn't cover are filled from `--clips` in name order. The
+in-point is where the clip starts playing; when there's not enough clip after
+it, the in-point moves earlier so the shot doesn't loop back to the start.
+`--effects zoom` on `render` applies effects to every cut that doesn't list its own.
+
+| effect | what it does |
+|---|---|
+| `flash` | white flash on the cut, fading out over 0.12 s |
+| `zoom` | punch-in on the cut, easing back over 0.3 s |
+| `shake` | camera shake on the cut, settling over 0.35 s |
+| `push` | slow push-in across the whole shot |
+
+Cut points are snapped to whole frames along the timeline, so a long edit
+doesn't drift off the beat.
+
 ### Sync camera footage to a separate audio recorder
 
 Shot on a camera with a field recorder running alongside (podcasts, interviews)?
@@ -302,6 +352,9 @@ recomputed behind your back.
       "clip": null,                     // pin a specific video here
       "asset": null,                    // pin a specific image here
       "fit": null,                      // per-segment override: cover | contain | blur
+      "clip_start": null,               // in-point in the clip: seconds or "MM:SS.s"
+      "speed": 1.0,                     // 0.5 = slow-mo, 2 = double speed
+      "effects": [],                    // flash, zoom, shake, push
       "transition": "cut"               // only "cut" is implemented today
     }
   ]
@@ -360,6 +413,7 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 | `assets --recipe R` | list the images the recipe needs, with reference stills |
 | `render --recipe R` | build a new video from the recipe + your media |
 | `make <file\|url>` | ingest and render in one step |
+| `beats <song>` | a recipe from a song alone, with a cut every N beats |
 | `sheet --recipe R` | rebuild the contact sheet (`--columns`, `--plain`) |
 | `show --recipe R` | print a recipe (`--json` for raw) |
 | `sync --videos V --takes T` | pair camera files with recorder takes by audio; `--out-dir` muxes them |
@@ -368,13 +422,14 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 
 Useful flags: `--fit`/`--asset-fit` (`cover`, `contain`, `blur`), `--no-captions`,
 `--audio-mode`, `--blank-text`, `--no-transcribe`, `--no-ocr`, `--no-visuals`,
-`--frame-fps`, `--scene-threshold`, `--download-timeout`, `--save-assignments`,
-`--keep-temp`.
+`--frame-fps`, `--scene-threshold`, `--min-shot`, `--download-timeout`,
+`--save-assignments`, `--keep-temp`, `--shots`, `--effects`.
 
 ## Not built yet
 
 - Transitions other than a hard cut (`transition` is parsed, not applied).
-- Per-segment speed ramps / zoom moves.
+- Speed *ramps* within a shot (a shot has one constant `speed`), velocity edits,
+  and motion blur.
 - Anything that picks *which* of your clips suits *which* slot — assignment is
   round-robin in order; pin `clip`/`asset` by hand when it matters.
 
@@ -391,7 +446,9 @@ reelforge/
   recipe.py     analysis -> editable recipe JSON
   captions.py   Pillow caption rasterizer (no libfreetype needed)
   sheet.py      contact sheet artifact
-  render.py     recipe + media -> mp4
+  render.py     recipe + media -> mp4 (in-points, speed, shot lists)
+  effects.py    flash / zoom / shake / push filters for beat hits
+  beats.py      song -> beat grid -> recipe with a cut every N beats
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   speakers.py   speaker labels from per-mic tracks, voice split for shared mics
   serve.py      local helper a web page drives (loopback only, paired)

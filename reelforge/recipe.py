@@ -14,6 +14,8 @@ RECIPE_VERSION = 1
 
 # Minimum segment length. Sub-half-second shots are almost always scene-detector
 # noise (a flash frame, a whip pan) rather than an editorial cut worth rebuilding.
+# Fast edits (AMVs, beat-synced montages) do cut faster than this; ingest takes
+# --min-shot to lower it.
 MIN_SEGMENT = 0.5
 
 
@@ -36,12 +38,13 @@ def _text_density(beats: int, duration: float) -> str:
     return "light"
 
 
-def _merge_short_segments(bounds: list[float], duration: float) -> list[tuple[float, float]]:
+def _merge_short_segments(bounds: list[float], duration: float,
+                           min_segment: float = MIN_SEGMENT) -> list[tuple[float, float]]:
     points = [0.0] + [b for b in bounds if 0 < b < duration] + [duration]
     segments: list[tuple[float, float]] = []
     start = points[0]
     for end in points[1:]:
-        if end - start < MIN_SEGMENT:
+        if end - start < min_segment:
             continue  # fold this sliver into the running segment
         segments.append((start, end))
         start = end
@@ -162,10 +165,11 @@ def build_recipe(
     platform: str,
     meta: dict,
     copy_source_text: bool = True,
+    min_segment: float = MIN_SEGMENT,
 ) -> dict:
     probe = analysis.probe
     duration = float(probe.get("duration") or 0.0)
-    spans = _merge_short_segments(analysis.cuts, duration)
+    spans = _merge_short_segments(analysis.cuts, duration, min_segment)
 
     segments = []
     for index, (start, end) in enumerate(spans):
@@ -345,6 +349,15 @@ def describe(recipe: dict) -> str:
         source = Path(source).name if source else "-"
         kind = (seg.get("visual") or {}).get("kind", "?")
         text = (seg.get("text") or "").replace("\n", " ")
+        extras = []
+        if seg.get("clip_start") is not None:
+            extras.append(f"@{seg['clip_start']}")
+        if seg.get("speed") not in (None, 1, 1.0):
+            extras.append(f"{seg['speed']}x")
+        if seg.get("effects"):
+            extras.append("+".join(seg["effects"]))
+        if extras:
+            text = (" ".join(extras) + ("  " + text if text else ""))
         lines.append(
             f"  {seg['index']:<3} {seg['role']:<6} {seg.get('fill', '?'):<8} {kind:<11}"
             f"{seg['start']:>6.2f} {seg['duration']:>6.2f}"

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
 
 from . import captions as captions_mod
+from . import effects as effects_mod
 from .shell import ToolError, ffmpeg, ffprobe_json, run
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".tif", ".tiff"}
@@ -127,6 +130,126 @@ def assign_sources(recipe: dict, clips: list[Path], assets: list[Path]) -> dict:
     return recipe
 
 
+_TIMECODE_RE = re.compile(r"^\d+(?::\d+){0,2}(?:\.\d+)?$")
+_SPEED_RE = re.compile(r"^\d+(?:\.\d+)?x$", re.I)
+
+
+def parse_shot_list(text: str, base_dir: Path,
+                    search_dirs: list[Path] | None = None) -> list[dict]:
+    """Parse a shot list: one line per footage segment, in timeline order.
+
+        # clip           in-point   effects       speed
+        gojo-01.mp4      0:03.2     zoom flash
+        sukuna.mov       12.5       shake         0.5x
+        toji.mp4                    -                     <- no effects
+        ...                                               <- keep segment as-is
+
+    Only the clip is required. A bare number or MM:SS is the in-point, `Nx`
+    is the speed, `-` clears effects, and any effect name is added. A line of
+    just `...` leaves that segment's existing settings alone. Clip names are
+    looked up next to the shot list, then in each `search_dirs` folder.
+    """
+    from . import effects as fx_mod
+
+    shots: list[dict] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError as exc:
+            raise ToolError(f"shot list line {number}: {exc}") from None
+        if tokens == ["..."]:
+            shots.append({})
+            continue
+
+        name, rest = tokens[0], tokens[1:]
+        candidates = [Path(name).expanduser()]
+        if not candidates[0].is_absolute():
+            candidates = [base_dir / name] + [d / name for d in (search_dirs or [])]
+        clip = next((c for c in candidates if c.is_file()), None)
+        if clip is None:
+            raise ToolError(f"shot list line {number}: clip not found: {name}")
+
+        shot: dict = {"clip": str(clip.resolve())}
+        effects: list[str] = []
+        for token in rest:
+            if _TIMECODE_RE.match(token):
+                if "clip_start" in shot:
+                    raise ToolError(f"shot list line {number}: two in-points ({token})")
+                from .ingest import parse_timecode
+                shot["clip_start"] = round(parse_timecode(token), 3)
+            elif _SPEED_RE.match(token):
+                shot["speed"] = fx_mod.parse_speed(token)
+            elif token == "-":
+                shot["effects"] = []
+            else:
+                effects += fx_mod.parse_effects(token)
+        if effects:
+            shot["effects"] = list(dict.fromkeys(shot.get("effects", []) + effects))
+        shots.append(shot)
+    if not shots:
+        raise ToolError("the shot list is empty")
+    return shots
+
+
+def apply_shot_list(recipe: dict, shots: list[dict]) -> list[str]:
+    """Pin shots onto the recipe's footage segments in order. Returns warnings."""
+    footage = footage_segments(recipe)
+    warnings = []
+    if len(shots) > len(footage):
+        warnings.append(
+            f"shot list has {len(shots)} shots but the recipe only has {len(footage)} "
+            f"footage segments; the last {len(shots) - len(footage)} are unused"
+        )
+    elif len(shots) < len(footage):
+        warnings.append(
+            f"shot list covers {len(shots)} of {len(footage)} footage segments; "
+            f"the rest are filled from --clips"
+        )
+    for segment, shot in zip(footage, shots):
+        segment.update(shot)
+    return warnings
+
+
+def snap_to_frames(segments: list[dict], fps: int) -> None:
+    """Give each segment a whole-frame length measured from the timeline.
+
+    Rendering each segment at its own rounded length drifts: 0.469s at 30fps
+    is 14.06 frames, encoded as 14, so every cut lands a little earlier than
+    the beat it was placed on and a 60-cut edit ends ~0.1s out of sync.
+    Rounding the *boundaries* instead keeps every cut within half a frame.
+    """
+    if fps <= 0:
+        return
+    position = 0.0
+    for segment in segments:
+        # Trust the recipe's own `start` when it is consistent with the
+        # running position; hand-edited recipes may not keep it up to date.
+        start = position
+        stated = segment.get("start")
+        if isinstance(stated, (int, float)) and abs(stated - position) < 0.01:
+            start = float(stated)
+        end = start + float(segment["duration"])
+        frames = round(end * fps) - round(start * fps)
+        segment["_render_duration"] = max(1, frames) / fps
+        position = end
+
+
+def clip_start_seconds(segment: dict) -> float | None:
+    """The segment's pinned in-point, from seconds or an 'MM:SS.ss' string."""
+    value = segment.get("clip_start")
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        if value < 0:
+            raise ToolError(f"segment {segment.get('index')}: negative clip_start {value}")
+        return float(value)
+    from .ingest import parse_timecode
+    return parse_timecode(str(value))
+
+
 def missing_sources(recipe: dict) -> tuple[list[dict], list[dict]]:
     """(footage segments without a clip, asset segments without an image)."""
     return (
@@ -218,13 +341,23 @@ def _fit_filter(width: int, height: int, fit: str) -> str:
 
 def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
                     font: str | None, fit: str, use_clip_audio: bool,
-                    crop: str | None = None) -> None:
+                    crop: str | None = None,
+                    default_effects: list[str] | None = None) -> None:
     clip = Path(segment_source(segment))
     info = _media_info(clip)
-    duration = float(segment["duration"])
+    duration = float(segment.get("_render_duration") or segment["duration"])
     width = int(recipe["target"]["width"])
     height = int(recipe["target"]["height"])
     fps = int(recipe["target"]["fps"])
+
+    # A segment's own `effects` (even an empty list) wins over the global set.
+    if "effects" in segment and segment["effects"] is not None:
+        fx = effects_mod.parse_effects(segment["effects"])
+    else:
+        fx = list(default_effects or [])
+    speed = 1.0 if info["is_image"] else effects_mod.parse_speed(segment.get("speed"))
+    # At 0.5x a 1s slot eats 0.5s of source; at 2x it eats 2s.
+    source_span = duration * speed
 
     args: list[str] = []
     clip_has_audio = info["has_audio"] and use_clip_audio and not info["is_image"]
@@ -234,15 +367,30 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
         args += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(clip)]
     else:
         clip_duration = info["duration"] or 0.0
-        offset = 0.0
-        if clip_duration > duration:
-            # Stagger reuses across the clip, but never past its end.
-            stride = max(0.0, clip_duration - duration)
-            reuse = segment.get("_reuse_index", 0)
-            offset = min(stride, reuse * duration)
-        if clip_duration and clip_duration < duration:
+        pinned = clip_start_seconds(segment)
+        if pinned is not None:
+            # The moment you picked. Past the end of the clip is a typo, not
+            # something to paper over with a silent loop.
+            if clip_duration and pinned >= clip_duration:
+                raise ToolError(
+                    f"segment {segment['index']}: clip_start {pinned:.2f}s is past the end "
+                    f"of {clip.name} ({clip_duration:.2f}s)"
+                )
+            offset = pinned
+            if clip_duration and pinned + source_span > clip_duration:
+                # Not enough clip after the chosen moment: hold on it by
+                # backing the in-point up instead of looping back to frame 0.
+                offset = max(0.0, clip_duration - source_span)
+        else:
+            offset = 0.0
+            if clip_duration > source_span:
+                # Stagger reuses across the clip, but never past its end.
+                stride = max(0.0, clip_duration - source_span)
+                reuse = segment.get("_reuse_index", 0)
+                offset = min(stride, reuse * source_span)
+        if clip_duration and clip_duration - offset < source_span:
             args += ["-stream_loop", "-1"]
-        args += ["-ss", f"{offset:.3f}", "-t", f"{duration:.3f}", "-i", str(clip)]
+        args += ["-ss", f"{offset:.3f}", "-t", f"{source_span:.3f}", "-i", str(clip)]
 
     caption_png = _caption_png(segment, recipe, font, tmp_dir)
     caption_index = None
@@ -260,6 +408,8 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
         next_input += 1
 
     crop_chain = _crop_filter(crop)
+    if speed != 1.0:
+        crop_chain = f"setpts=(PTS-STARTPTS)/{speed:.6f}," + crop_chain
 
     if fit == "blur":
         chain = (
@@ -275,6 +425,10 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
         tail = (f"[0:v]{crop_chain}{_fit_filter(width, height, fit)},"
                 f"fps={fps},setsar=1")
 
+    fx_chain = effects_mod.filter_chain(fx, width, height, duration)
+    if fx_chain:
+        tail += "," + fx_chain
+
     if caption_index is not None:
         # Composite the caption before flattening to yuv420p so the PNG's alpha
         # is respected.
@@ -286,6 +440,9 @@ def _render_segment(segment: dict, recipe: dict, out_path: Path, tmp_dir: Path,
 
     filter_complex = chain + tail
     audio_map = "0:a:0" if clip_has_audio else f"{audio_input_index}:a:0"
+    if clip_has_audio and speed != 1.0:
+        filter_complex += f";[0:a:0]{effects_mod.atempo_chain(speed)}[a]"
+        audio_map = "[a]"
 
     ffmpeg(args + [
         "-filter_complex", filter_complex,
@@ -349,6 +506,9 @@ def _apply_audio(video: Path, recipe: dict, out_path: Path,
 
     ffmpeg([
         "-i", str(video),
+        # `music_start` lets a recipe built from the middle of a song (the
+        # drop, the chorus) line its beats up with the same spot in the track.
+        "-ss", f"{float(audio_cfg.get('music_start') or 0.0):.3f}",
         "-stream_loop", "-1", "-i", str(music),
         "-filter_complex", f"[1:a]{afilter},atrim=0:{duration:.3f},asetpts=PTS-STARTPTS[a]",
         "-map", "0:v:0", "-map", "[a]",
@@ -369,10 +529,15 @@ def render(
     asset_fit: str = "blur",
     crop: str | None = None,
     font: str | None = None,
+    effects: list[str] | None = None,
     keep_temp: bool = False,
     on_progress=None,
 ) -> Path:
-    """Render `recipe` to `out_path`, returning the written file."""
+    """Render `recipe` to `out_path`, returning the written file.
+
+    `effects` applies to every segment that does not list its own.
+    """
+    default_effects = effects_mod.parse_effects(effects)
     assign_sources(recipe, clips or [], assets or [])
 
     segments = recipe.get("segments", [])
@@ -429,6 +594,8 @@ def render(
     out_path = Path(out_path).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    snap_to_frames(segments, int(recipe["target"]["fps"]))
+
     tmp_root = Path(tempfile.mkdtemp(prefix="reelforge-render-"))
     try:
         parts: list[Path] = []
@@ -450,6 +617,7 @@ def render(
                 segment, recipe, part, tmp_root, font_path, segment_fit,
                 use_clip_audio=recipe.get("audio", {}).get("mode") == "source",
                 crop=segment_crop,
+                default_effects=default_effects,
             )
             parts.append(part)
 

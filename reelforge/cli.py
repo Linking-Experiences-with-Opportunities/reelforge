@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 from . import analyze as analyze_mod
+from . import beats as beats_mod
 from . import captions as captions_mod
 from . import ingest as ingest_mod
 from . import match as match_mod
@@ -83,6 +85,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         platform=source.platform,
         meta=source.meta,
         copy_source_text=not args.blank_text,
+        min_segment=args.min_shot,
     )
     recipe_path = source.project_dir / "recipe.json"
     recipe_mod.save_recipe(built, recipe_path)
@@ -240,6 +243,17 @@ def cmd_render(args: argparse.Namespace) -> int:
     if args.no_captions:
         data.setdefault("captions", {})["enabled"] = False
 
+    if getattr(args, "shots", None):
+        shots_path = Path(args.shots).expanduser()
+        if not shots_path.is_file():
+            raise ToolError(f"shot list not found: {shots_path}")
+        search = [Path(c).expanduser() for c in (args.clips or []) if Path(c).expanduser().is_dir()]
+        shots = render_mod.parse_shot_list(shots_path.read_text("utf-8"),
+                                           shots_path.parent, search)
+        for warning in render_mod.apply_shot_list(data, shots):
+            _print(f"   note: {warning}")
+        _print(f"-> {len(shots)} shot(s) pinned from {shots_path.name}")
+
     out_path = Path(args.out).expanduser()
     _print(f"-> rendering {len(data['segments'])} segments")
 
@@ -253,6 +267,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         asset_fit=args.asset_fit,
         crop=args.crop,
         font=args.font,
+        effects=getattr(args, "effects", None),
         keep_temp=args.keep_temp,
         on_progress=_progress,
     )
@@ -264,6 +279,61 @@ def cmd_render(args: argparse.Namespace) -> int:
     size_mb = result.stat().st_size / (1024 * 1024)
     _print()
     _print(f"-> {result}  ({size_mb:.1f} MB)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# beats (a recipe from a song alone)
+# --------------------------------------------------------------------------- #
+
+def cmd_beats(args: argparse.Namespace) -> int:
+    song = Path(args.song).expanduser()
+    start = ingest_mod.parse_timecode(args.start) if args.start else 0.0
+    duration = ingest_mod.parse_timecode(args.duration) if args.duration else None
+    size = args.size.lower().split("x")
+    try:
+        width, height = int(size[0]), int(size[1])
+    except (ValueError, IndexError):
+        raise ToolError(f"--size expects WIDTHxHEIGHT, got {args.size!r}") from None
+
+    _print(f"-> finding the beat in {song.name} ...")
+    built = beats_mod.build_beat_recipe(
+        song,
+        every=args.every,
+        start=start,
+        duration=duration,
+        bpm=args.bpm,
+        effects=args.effects,
+        accent_effects=args.accent,
+        bar_offset=args.bar_offset,
+        width=width,
+        height=height,
+        fps=args.fps,
+        name=args.name,
+    )
+
+    if args.out:
+        recipe_path = Path(args.out).expanduser()
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "-", (args.name or song.stem).lower()).strip("-") or "song"
+        recipe_path = Path(args.projects).expanduser() / f"{slug}-beats" / "recipe.json"
+    recipe_path.parent.mkdir(parents=True, exist_ok=True)
+    recipe_mod.save_recipe(built, recipe_path)
+    check = beats_mod.write_beat_check(built, recipe_path.parent / "beat-check.wav")
+
+    footage = len(built["segments"])
+    _print()
+    _print(recipe_mod.describe(built))
+    _print()
+    _print(f"   recipe   {recipe_path}")
+    _print(f"   listen   {check}")
+    _print("            (a click on every cut, higher on bar starts - if they drift off")
+    _print("             the drums, re-run with --bpm; if only the high ones are off, --bar-offset)")
+    _print(f"   {footage} cuts - give it {footage} shots, or fewer and they repeat.")
+    _print()
+    _print("   next:  reelforge render --recipe "
+           f"{recipe_path} \\\n"
+           "             --clips ./my-clips [--shots shots.txt] --out edit.mp4")
     return 0
 
 
@@ -289,6 +359,7 @@ def cmd_make(args: argparse.Namespace) -> int:
         frame_fps=args.frame_fps,
         sheet_columns=args.sheet_columns,
         blank_text=args.blank_text,
+        min_shot=args.min_shot,
     )
     status = cmd_ingest(ingest_args)
     if status != 0:
@@ -310,6 +381,8 @@ def cmd_make(args: argparse.Namespace) -> int:
         keep_temp=False,
         audio_mode=args.audio_mode,
         no_captions=args.no_captions,
+        effects=args.effects,
+        shots=args.shots,
         save_assignments=True,
     )
     _print()
@@ -649,6 +722,11 @@ def _add_ingest_options(parser: argparse.ArgumentParser) -> None:
                         help="cut sensitivity, 0-1; lower finds more cuts (default: 0.28)")
     parser.add_argument("--blank-text", action="store_true",
                         help="leave segment 'text' empty instead of copying the source's words")
+    parser.add_argument("--min-shot", type=float, default=recipe_mod.MIN_SEGMENT,
+                        metavar="SECONDS",
+                        help="shots shorter than this are merged into the previous one "
+                             f"(default: {recipe_mod.MIN_SEGMENT}; try 0.15 for fast edits "
+                             "like AMVs, with --scene-threshold 0.2)")
 
 
 def _add_render_options(parser: argparse.ArgumentParser) -> None:
@@ -672,6 +750,12 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
                         help="override the recipe's audio mode")
     parser.add_argument("--no-captions", action="store_true",
                         help="render without any text overlays")
+    parser.add_argument("--effects", metavar="LIST",
+                        help="effects for every segment that does not list its own: "
+                             "flash, zoom, shake, push (comma-separated)")
+    parser.add_argument("--shots", metavar="FILE",
+                        help="shot list: one line per footage segment - "
+                             "'clip.mp4 [in-point] [effects] [speed]'")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -721,6 +805,36 @@ def build_parser() -> argparse.ArgumentParser:
         "assets", help="list the images/diagrams a recipe needs, with reference stills")
     p_assets.add_argument("--recipe", required=True)
     p_assets.set_defaults(func=cmd_assets)
+
+    p_beats = sub.add_parser(
+        "beats", help="build a recipe from a song alone, with a cut on every beat")
+    p_beats.add_argument("song", help="audio or video file with the track")
+    p_beats.add_argument("--every", type=float, default=1.0, metavar="BEATS",
+                         help="cut every N beats: 1, 2, 4 (a bar), or 0.5 for half beats "
+                              "(default: 1)")
+    p_beats.add_argument("--start", metavar="TIMECODE",
+                         help="where in the song the edit begins, e.g. 0:42 for the drop")
+    p_beats.add_argument("--duration", metavar="TIMECODE",
+                         help="how long the edit runs from --start (default: to the end)")
+    p_beats.add_argument("--bpm", type=float,
+                         help="tempo, if the detected one is wrong (often half or double)")
+    p_beats.add_argument("--effects", default="zoom", metavar="LIST",
+                         help="effects on ordinary cuts (default: zoom; 'none' for plain cuts)")
+    p_beats.add_argument("--accent", default="flash,shake", metavar="LIST",
+                         help="effects on the first beat of each bar "
+                              "(default: flash,shake; 'none' to treat bars like any cut)")
+    p_beats.add_argument("--bar-offset", type=int, choices=range(4), metavar="N",
+                         help="shift which beats count as bar starts (0-3). By default "
+                              "the bar start is guessed from the kick drum")
+    p_beats.add_argument("--size", default="1080x1920", help="output size (default: 1080x1920)")
+    p_beats.add_argument("--fps", type=int, default=30, help="output frame rate (default: 30)")
+    p_beats.add_argument("--name", help="project name (default: the song's file name)")
+    p_beats.add_argument("--out", metavar="FILE",
+                         help="where to write the recipe "
+                              "(default: <projects>/<song>-beats/recipe.json)")
+    p_beats.add_argument("--projects", default=str(DEFAULT_PROJECTS),
+                         help=f"where projects are stored (default: {DEFAULT_PROJECTS})")
+    p_beats.set_defaults(func=cmd_beats)
 
     p_make = sub.add_parser("make", help="ingest a source and render in one step")
     p_make.add_argument("source")
