@@ -364,6 +364,7 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 | `show --recipe R` | print a recipe (`--json` for raw) |
 | `sync --videos V --takes T` | pair camera files with recorder takes by audio; `--out-dir` muxes them |
 | `speakers --transcript J --mic N=MIC …` | label a take's transcript by speaker from per-mic tracks; per-camera SRTs |
+| `model check\|sheet\|lineup\|export SPEC…` | prop models written in millimetres: prove them sound, draw them beside reference photos, export them |
 | `doctor` | check tools and caption backend |
 
 Useful flags: `--fit`/`--asset-fit` (`cover`, `contain`, `blur`), `--no-captions`,
@@ -395,6 +396,7 @@ reelforge/
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   speakers.py   speaker labels from per-mic tracks, voice split for shared mics
   serve.py      local helper a web page drives (loopback only, paired)
+  model3d.py    prop models in millimetres: checks, turnaround sheets, TS/OBJ export
   cli.py        argparse front end
 tools/
   make_fixture.py   synthetic test reel generator
@@ -483,6 +485,60 @@ the rest:
 
 `GET /health` reports `demo: {claude, codex, codex_signed_in, agent, dir, ready}`. The job's log is the agent's
 narration; its result carries the MP4 path from the skill's report.
+
+### Model real objects in 3D (`reelforge model`)
+
+When a scene needs real things in it (the keyboard on your desk, a speaker, a
+games console), describe each one once as a **prop spec**: a JSON file listing
+the boxes, cylinders and spheres it is made of, **in millimetres**, measured
+from the real object or its spec sheet. Because every prop uses real
+measurements, they all come out at the same scale as each other.
+
+```json
+{
+  "name": "echo-studio",
+  "title": "Amazon Echo Studio",
+  "size_mm": [175, 206, 175],
+  "source": "Amazon spec sheet: 175 mm across, 206 mm tall",
+  "refs": ["../refs/echo-studio.jpg"],
+  "parts": [
+    {"name": "base", "shape": "cylinder", "at": [0, 16, 0], "size": [175, 32, 175], "color": "#27282c", "finish": "fabric"},
+    {"name": "body", "shape": "cylinder", "at": [0, 122, 0], "size": [175, 136, 175], "color": "#27282c", "finish": "fabric"}
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `size_mm` | the real object's width, height and depth. The parts must add up to this. |
+| `at`, `size` | a part's centre and its width, height, depth. The origin is the centre of the footprint, on the surface the object stands on. x is right, y is up, z is toward you. |
+| `rot` | degrees about x, then y, then z. A cylinder's axis is y until you turn it. |
+| `shape` | `box`, `cylinder` or `sphere` (a sphere with unequal sizes is an ellipsoid). |
+| `finish` | `matte`, `satin`, `gloss`, `fabric`, `metal` or `glow`. |
+| `paint` | optional: the name of a painted surface the renderer supplies (a keyboard's keys, a whiteboard's writing). |
+| `grid` | optional: repeat the part, e.g. `{"count": [4, 4], "step": [19, 19], "skip": [[0, 0]]}` for a key matrix. |
+
+```bash
+reelforge model check  props/                 # is every prop sound?
+reelforge model sheet  props/                 # a turnaround per prop, beside its reference photos
+reelforge model lineup props/                 # all of them on one ground line, at one scale
+reelforge model export props/ --out loot.ts   # one TypeScript module (or --format obj --out folder/)
+```
+
+`check` fails a prop when:
+
+- its parts do not add up to `size_mm` (within 2%, or 1.5 mm),
+- its lowest point is not on the ground (y = 0),
+- any part **floats**: it touches nothing that leads back to the ground.
+
+It warns when the footprint is off centre, when there is no `source` for the
+measurements, or when a reference photo is missing. `sheet`, `lineup` and
+`export` run the checks first and stop on an error (`--force` overrides).
+
+The sheet is how you judge likeness: front, side, top and three-quarter views
+at one scale with a ruler, and your photos underneath. With numpy installed the
+views are drawn with a depth buffer; without it, parts that pass through each
+other can draw in the wrong order.
 
 ## Tests
 

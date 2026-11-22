@@ -11,6 +11,7 @@ from . import analyze as analyze_mod
 from . import captions as captions_mod
 from . import ingest as ingest_mod
 from . import match as match_mod
+from . import model3d as model_mod
 from . import recipe as recipe_mod
 from . import render as render_mod
 from . import serve as serve_mod
@@ -573,6 +574,64 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return serve_mod.serve(Path(args.projects).expanduser(), args.port, args.allow_origin)
 
 
+# --------------------------------------------------------------------------- #
+# model: props described in millimetres, checked, drawn and exported
+# --------------------------------------------------------------------------- #
+
+def _spec_paths(items: list[str]) -> list[Path]:
+    """Spec files, or every .json in a folder, in name order."""
+    paths: list[Path] = []
+    for item in items:
+        path = Path(item).expanduser()
+        paths += sorted(path.glob("*.json")) if path.is_dir() else [path]
+    if not paths:
+        raise ToolError("no prop specs found")
+    return paths
+
+
+def _checked_props(items: list[str]) -> tuple[list, int]:
+    """Load and check every spec, printing what is wrong. Returns the props and the error count."""
+    props, errors = [], 0
+    for path in _spec_paths(items):
+        prop = model_mod.load_prop(path)
+        issues = model_mod.check_prop(prop)
+        bad = [issue for issue in issues if issue.level == "error"]
+        errors += len(bad)
+        w, h, d = prop.size_mm
+        mark = "FAIL" if bad else "ok"
+        _print(f"{mark:>4}  {prop.name}: {w:g} x {h:g} x {d:g} mm, {len(prop.parts)} parts")
+        for issue in issues:
+            _print(f"      {issue.level}: {issue.message}")
+        props.append(prop)
+    return props, errors
+
+
+def cmd_model(args: argparse.Namespace) -> int:
+    props, errors = _checked_props(args.specs)
+    if args.action == "check":
+        return 1 if errors else 0
+    if errors and not args.force:
+        raise ToolError(f"{errors} check(s) failed; fix the specs, or pass --force to go on anyway")
+
+    if args.action == "sheet":
+        for prop in props:
+            folder = Path(args.out).expanduser() if args.out else (prop.path.parent.parent / "sheets")
+            _print(f"sheet: {model_mod.build_sheet(prop, folder / f'{prop.name}.jpg')}")
+    elif args.action == "lineup":
+        out = Path(args.out).expanduser() if args.out else (props[0].path.parent.parent / "sheets" / "lineup.jpg")
+        _print(f"lineup: {model_mod.build_lineup(props, out)}")
+    elif args.action == "export":
+        if not args.out:
+            raise ToolError("export needs --out (a .ts file, or a folder for --format obj)")
+        out = Path(args.out).expanduser()
+        if args.format == "ts":
+            _print(f"wrote {model_mod.export_ts(props, out, args.const)} ({len(props)} props)")
+        else:
+            for prop in props:
+                _print(f"wrote {model_mod.export_obj(prop, out / f'{prop.name}.obj')}")
+    return 0
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     checks = [
         ("ffmpeg", True, "brew install ffmpeg", "render + analyze"),
@@ -790,6 +849,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_match.add_argument("--report", metavar="FILE", help="write measurements and filters as JSON")
     p_match.add_argument("--suffix", default="-matched", help="added to output file names")
     p_match.set_defaults(func=cmd_match)
+
+    p_model = sub.add_parser(
+        "model", help="check, draw and export prop models written in millimetres")
+    p_model.add_argument("action", choices=["check", "sheet", "lineup", "export"],
+                         help="check: prove the specs are sound. sheet: a turnaround beside "
+                              "the reference photos. lineup: all props at one scale. "
+                              "export: write them out for a renderer")
+    p_model.add_argument("specs", nargs="+", metavar="SPEC",
+                         help="prop spec .json files, or a folder of them")
+    p_model.add_argument("--out", metavar="PATH",
+                         help="where to write (default: a sheets/ folder beside the specs)")
+    p_model.add_argument("--format", default="ts", choices=["ts", "obj"],
+                         help="export format (default: ts, one TypeScript module)")
+    p_model.add_argument("--const", default="PROPS",
+                         help="name of the exported TypeScript constant (default: PROPS)")
+    p_model.add_argument("--force", action="store_true",
+                         help="draw or export even when a check fails")
+    p_model.set_defaults(func=cmd_model)
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)

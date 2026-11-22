@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reelforge import analyze, captions, ingest, recipe, render, sheet, speakers, sync, visuals
+from reelforge import analyze, captions, ingest, model3d, recipe, render, sheet, speakers, sync, visuals
 
 
 class TestUrlClassification(unittest.TestCase):
@@ -784,6 +784,80 @@ class TestReviewFixes(unittest.TestCase):
             a, b = fresh_dir(Path(tmp) / "Sync", "s"), fresh_dir(Path(tmp) / "Sync", "s")
             self.assertEqual((a.name, b.name), ("s", "s-2"))
             self.assertTrue(a.is_dir() and b.is_dir())
+
+class TestPropModels(unittest.TestCase):
+    """A prop spec is checked against the size it claims, the ground, and itself."""
+
+    def _mug(self, **changes):
+        data = {
+            "name": "mug", "size_mm": [80, 95, 80], "source": "ruler",
+            "parts": [
+                {"name": "cup", "shape": "cylinder", "at": [0, 47.5, 0], "size": [80, 95, 80], "color": "#ffffff"},
+                {"name": "coffee", "shape": "cylinder", "at": [0, 94.5, 0], "size": [70, 1, 70], "color": "#3b2416"},
+            ],
+        }
+        data.update(changes)
+        return model3d.prop_from_dict(data)
+
+    def test_sound_prop_has_no_issues(self):
+        self.assertEqual(model3d.check_prop(self._mug()), [])
+
+    def test_wrong_size_is_an_error(self):
+        issues = model3d.check_prop(self._mug(size_mm=[80, 120, 80]))
+        self.assertTrue(any(i.level == "error" and "height" in i.message for i in issues))
+
+    def test_floating_part_is_an_error(self):
+        prop = self._mug()
+        prop.parts[1].at = (0, 94.5, 200)  # the coffee, moved out into the air beside the cup
+        issues = model3d.check_prop(prop)
+        self.assertTrue(any("floating" in i.message and "coffee" in i.message for i in issues))
+
+    def test_not_on_the_ground_is_an_error(self):
+        prop = self._mug()
+        for part in prop.parts:
+            part.at = (part.at[0], part.at[1] + 10, part.at[2])
+        self.assertTrue(any("rest on y = 0" in i.message for i in model3d.check_prop(prop)))
+
+    def test_grid_expands_and_skips(self):
+        prop = model3d.prop_from_dict({
+            "name": "keys", "size_mm": [35, 8, 35],
+            "parts": [{"name": "key", "shape": "box", "at": [-9.5, 4, -9.5], "size": [16, 8, 16],
+                       "grid": {"count": [2, 2], "step": [19, 19], "skip": [[1, 1]]}}],
+        })
+        self.assertEqual([p.name for p in prop.parts], ["key-0-0", "key-1-0", "key-0-1"])
+
+    def test_rotation_turns_a_cylinder_onto_its_side(self):
+        prop = model3d.prop_from_dict({
+            "name": "bar", "size_mm": [100, 20, 20],
+            "parts": [{"shape": "cylinder", "at": [0, 10, 0], "size": [20, 100, 20], "rot": [0, 0, 90]}],
+        })
+        lo, hi = model3d.prop_bounds(prop)
+        self.assertAlmostEqual(hi[0] - lo[0], 100, places=3)
+        self.assertEqual([i for i in model3d.check_prop(prop) if i.level == "error"], [])
+
+    def test_bad_spec_is_rejected(self):
+        with self.assertRaises(model3d.ToolError):
+            model3d.prop_from_dict({"name": "x", "size_mm": [1, 1, 1], "parts": [{"shape": "cone", "at": [0, 0, 0], "size": [1, 1, 1]}]})
+        with self.assertRaises(model3d.ToolError):
+            model3d.prop_from_dict({"name": "x", "size_mm": [1, 1, 1], "parts": [{"shape": "box", "at": [0, 0, 0], "size": [1, 0, 1]}]})
+
+    def test_exports(self):
+        prop = self._mug()
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = model3d.export_ts([prop], Path(tmp) / "props.ts").read_text()
+            self.assertIn("export type PropName = 'mug';", ts)
+            self.assertIn('"shape": "cylinder"', ts)
+            obj = model3d.export_obj(prop, Path(tmp) / "mug.obj")
+            self.assertIn("usemtl c0", obj.read_text())
+            self.assertIn("Kd 1.0000 1.0000 1.0000", obj.with_suffix(".mtl").read_text())
+
+    @unittest.skipUnless(model3d.PILLOW_AVAILABLE, "Pillow not installed")
+    def test_sheet_and_lineup_are_drawn(self):
+        prop = self._mug()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(model3d.build_sheet(prop, Path(tmp) / "mug.jpg").stat().st_size > 2000)
+            self.assertTrue(model3d.build_lineup([prop, prop], Path(tmp) / "lineup.jpg").stat().st_size > 2000)
+
 
 if __name__ == "__main__":
     unittest.main()
