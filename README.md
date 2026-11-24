@@ -418,6 +418,8 @@ it. Tunables live at the top of `reelforge/visuals.py`.
 | `show --recipe R` | print a recipe (`--json` for raw) |
 | `sync --videos V --takes T` | pair camera files with recorder takes by audio; `--out-dir` muxes them |
 | `speakers --transcript J --mic N=MIC …` | label a take's transcript by speaker from per-mic tracks; per-camera SRTs |
+| `match --camera NAME CLIPS …` | make footage from different cameras look like one camera shot it |
+| `clean <files\|folders>` | cleaned copies with less background noise and a steady volume |
 | `doctor` | check tools and caption backend |
 
 Useful flags: `--fit`/`--asset-fit` (`cover`, `contain`, `blur`), `--no-captions`,
@@ -451,6 +453,7 @@ reelforge/
   beats.py      song -> beat grid -> recipe with a cut every N beats
   sync.py       camera <-> recorder matching by audio cross-correlation, muxing
   speakers.py   speaker labels from per-mic tracks, voice split for shared mics
+  clean.py      audio cleanup: learned noise reduction, loudness
   serve.py      local helper a web page drives (loopback only, paired)
   native.py     dialogs, file pickers, open/reveal, stopping a job (macOS + Windows)
   cli.py        argparse front end
@@ -514,13 +517,14 @@ Cancelling a job stops its whole process tree (`killpg` on macOS, `taskkill /T`
 on Windows). On Windows the page installs Codex with `npm install --global
 @openai/codex`, so it needs Node.js; on a Mac it uses Homebrew.
 
-The same page also runs three footage tools through the helper, each the ordinary CLI:
+The same page also runs four footage tools through the helper, each the ordinary CLI:
 
 | On the page | Route | Runs | Lands in `~/Movies/Reelforge/` |
 |---|---|---|---|
 | Podcast sync | `POST /sync` `{videos, takes}` | `reelforge sync` | `Podcast sync/<time>/` (synced copies + `sync-report.json`) |
 | Speaker labels | `POST /speakers` `{take, mics: [{name, path}], sync_report?}` | `reelforge speakers` (whisper writes the transcript) | `Speaker labels/<time>/` (`.txt`, `.srt`, one SRT per camera) |
 | Camera matching | `POST /match` `{cameras: [{name, paths}], ref, smooth?}` | `reelforge match` | `Camera matching/<time>/` (corrected copies + `match-report.json`) |
+| Audio cleanup | `POST /clean` `{files, strength?, normalize?}` | `reelforge clean` | `Audio cleanup/<time>/` (cleaned copies) |
 
 `/health` lists them under `features`, so the page can tell an older helper to update.
 
@@ -535,6 +539,29 @@ reference one. Every clip from a camera gets the same correction: differences be
 are kept, the difference between cameras is removed. iPhone HDR clips are converted to SDR
 on the way (macOS). `--smooth 0.5` also nudges each clip's brightness halfway toward the
 middle of the set. Without `--out-dir` it only reports.
+
+### Audio cleanup (`reelforge clean`)
+
+```bash
+reelforge clean interview.mp4 voiceover.wav          # -> interview-clean.mp4, voiceover-clean.wav
+reelforge clean day1/ --out-dir cleaned/ --strength strong
+```
+
+For hiss, room tone, a fan or an air conditioner behind a voice. Each file gets a cleaned
+copy next to it (or in `--out-dir`); the source is never changed. A video keeps its picture
+untouched (stream copy) and only the audio is re-encoded.
+
+It finds the quietest half second of the recording (nobody talking), has ffmpeg's `afftdn`
+learn the noise from that, and subtracts it from the whole file; an 80 Hz high-pass drops
+rumble first. The volume is then set to -16 LUFS (`--loudness`, or `--no-normalize` to leave
+it). `--strength light|normal|strong` asks for 6, 12 or 20 dB of reduction. Each line of
+output says how much quieter the background got, measured on that same half second.
+
+When no stretch is clearly quieter than the rest (wall-to-wall talking, or music), there is
+nothing to learn from, and it falls back to a gentler pass that tracks the noise floor.
+This is basic cleanup: it does not remove echo, other voices, or sudden sounds like a door.
+
+Lossless audio (wav, flac, aiff) comes out as wav; other audio as m4a (AAC 192k).
 
 ---
 

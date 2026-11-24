@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reelforge import analyze, captions, ingest, recipe, render, sheet, speakers, sync, visuals
+from reelforge import analyze, captions, clean, ingest, recipe, render, sheet, speakers, sync, visuals
 
 
 class TestUrlClassification(unittest.TestCase):
@@ -844,6 +844,76 @@ class TestCameraMatch(unittest.TestCase):
                          "brighter, more colour, warmer")
 
 
+class TestClean(unittest.TestCase):
+    """Audio cleanup: where the noise sample comes from, and what gets written."""
+
+    def test_quiet_stretch_is_the_gap_between_speech(self):
+        env = [0.05] * 100 + [0.004] * 40 + [0.05] * 100
+        start, end = clean.quiet_stretch(env, rate=50)
+        self.assertGreaterEqual(start, 2.0)
+        self.assertLessEqual(end, 2.8)
+        self.assertAlmostEqual(end - start, clean.SAMPLE_SECONDS)
+
+    def test_no_stretch_without_a_clear_gap(self):
+        self.assertIsNone(clean.quiet_stretch([0.05, 0.04] * 200, rate=50))   # wall-to-wall sound
+        self.assertIsNone(clean.quiet_stretch([0.05] * 30, rate=50))          # too short
+        self.assertIsNone(clean.quiet_stretch([0.0] * 400, rate=50))          # silence
+
+    def test_digital_silence_is_not_a_noise_sample(self):
+        # a muted stretch is quieter than the room, but holds no noise to learn
+        env = [0.05] * 100 + [0.0] * 50 + [0.05] * 100 + [0.004] * 40 + [0.05] * 100
+        start, _ = clean.quiet_stretch(env, rate=50)
+        self.assertGreaterEqual(start, 5.0)
+
+    def test_denoise_graph(self):
+        learned = clean.denoise_graph("normal", (2.0, 2.5))
+        self.assertIn("atrim=2.000:2.500", learned)
+        self.assertIn("afftdn sn start", learned)
+        self.assertIn("atrim=start=0.500", learned)   # the sample is trimmed back off
+        self.assertIn("afftdn=nr=12", learned)
+        tracked = clean.denoise_graph("strong", None)
+        self.assertIn("afftdn=nr=20:nf=-40:tn=1", tracked)
+        self.assertNotIn("concat", tracked)
+
+    def test_output_names(self):
+        taken: set[str] = set()
+        self.assertEqual(clean.output_name(Path("a/Take.WAV"), False, "-clean", taken), "Take-clean.wav")
+        self.assertEqual(clean.output_name(Path("b/take.flac"), False, "-clean", taken), "take-clean-2.wav")
+        self.assertEqual(clean.output_name(Path("a/take.mp3"), False, "-clean", taken), "take-clean.m4a")
+        self.assertEqual(clean.output_name(Path("a/C0001.MP4"), True, "-clean", taken), "C0001-clean.mp4")
+
+    def test_parse_loudnorm(self):
+        text = '''[Parsed_loudnorm_1 @ 0x1] 
+{
+	"input_i" : "-23.10",
+	"input_tp" : "-4.20",
+	"input_lra" : "3.00",
+	"input_thresh" : "-33.50",
+	"output_i" : "-16.00",
+	"output_tp" : "-1.50",
+	"output_lra" : "2.00",
+	"output_thresh" : "-26.30",
+	"normalization_type" : "dynamic",
+	"target_offset" : "0.10"
+}'''
+        stats = clean.parse_loudnorm(text)
+        self.assertEqual(stats["input_i"], -23.1)
+        self.assertIn("measured_I=-23.1:measured_TP=-4.2", clean.loudnorm_filter(stats, -16))
+        self.assertIsNone(clean.parse_loudnorm(text.replace("-23.10", "-inf")))   # silence
+        self.assertIsNone(clean.parse_loudnorm("no json here"))
+
+    def test_summary(self):
+        r = clean.Result(Path("a.wav"), Path("a-clean.wav"), True, -40.0, -52.0, -23.0, -16.0)
+        self.assertEqual(r.summary(), "background 12 dB quieter, volume -23 -> -16 LUFS")
+        r = clean.Result(Path("a.wav"), Path("a-clean.wav"), False, None, None, None, None)
+        self.assertIn("cleaned gently", r.summary())
+
+    def test_cli_parses(self):
+        from reelforge import cli
+        args = cli.build_parser().parse_args(["clean", "a.wav", "clips/", "--strength", "light", "--no-normalize"])
+        self.assertEqual((args.inputs, args.strength, args.no_normalize), (["a.wav", "clips/"], "light", True))
+
+
 class TestHelperToolArgs(unittest.TestCase):
     """What the page may ask the helper to run for podcast sync, speaker labels and camera matching."""
 
@@ -902,6 +972,17 @@ class TestHelperToolArgs(unittest.TestCase):
                     {"cameras": [{"name": "Sony", "paths": []}, body["cameras"][1]]}):
             with self.assertRaises(self.serve.ApiError):
                 self.serve.match_args(bad, self.out)
+
+    def test_clean_args(self):
+        args = self.serve.clean_args({"files": [self.f("a.mp4"), self.f("take.wav")]}, self.out)
+        self.assertEqual(args, ["clean", self.f("a.mp4"), self.f("take.wav"),
+                                "--out-dir", str(self.out), "--strength", "normal"])
+        args = self.serve.clean_args({"files": [self.f("take.wav")], "strength": "strong", "normalize": False}, self.out)
+        self.assertEqual(args[-3:], ["--strength", "strong", "--no-normalize"])
+        for bad in ({}, {"files": []}, {"files": [self.f("gone.wav")]}, {"files": ["--out-dir"]},
+                    {"files": [self.f("take.wav")], "strength": "max"}):
+            with self.assertRaises(self.serve.ApiError):
+                self.serve.clean_args(bad, self.out)
 
     def test_match_cli_parses_cameras(self):
         from reelforge import cli
@@ -966,7 +1047,7 @@ class TestServeHelper(unittest.TestCase):
         self.assertEqual(res.getheader("Access-Control-Allow-Origin"), self.ORIGIN)
 
     def test_health_lists_the_tools_and_a_bad_request_starts_nothing(self):
-        self.assertEqual(self.call("GET", "/health", token=None)[1]["features"], ["sync", "speakers", "match"])
+        self.assertEqual(self.call("GET", "/health", token=None)[1]["features"], ["sync", "speakers", "match", "clean"])
         status, body, _ = self.call("POST", "/match", {"cameras": []})
         self.assertEqual(status, 400)
         self.assertIn("two cameras", body["error"])

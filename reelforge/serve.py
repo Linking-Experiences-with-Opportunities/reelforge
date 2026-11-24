@@ -45,7 +45,8 @@ AUDIO_MODES = {"music", "source", "silent"}
 MAX_BODY = 4 * 1024 * 1024
 MAX_LOG_LINES = 4000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
-FEATURES = ("sync", "speakers", "match")
+FEATURES = ("sync", "speakers", "match", "clean")
+CLEAN_STRENGTHS = ("light", "normal", "strong")
 _SPEAKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._'-]{0,39}$")
 _PROJECT_LINE = re.compile(r"^-> project (.+)$")
 _OUT_LINE = re.compile(r"^-> (.+\.mp4)\s+\(")
@@ -228,6 +229,20 @@ def match_args(body: dict, out_dir: Path) -> list[str]:
     return args
 
 
+def clean_args(body: dict, out_dir: Path) -> list[str]:
+    """Audio cleanup: less background noise and a steady volume, as cleaned copies."""
+    files = _existing(_paths(body.get("files"), "files"), "files")
+    if not files:
+        raise ApiError(400, "pick the recordings to clean")
+    strength = str(body.get("strength") or "normal")
+    if strength not in CLEAN_STRENGTHS:
+        raise ApiError(400, "strength is light, normal or strong")
+    args = ["clean", *files, "--out-dir", str(out_dir), "--strength", strength]
+    if body.get("normalize") is False:
+        args.append("--no-normalize")
+    return args
+
+
 def tool_status() -> dict:
     return {tool: have(tool) for tool in ("ffmpeg", "ffprobe", "yt-dlp", "whisper", "tesseract")}
 
@@ -364,6 +379,7 @@ PICK_KINDS = {
     "audio": (AUDIO_SUFFIXES, False),
     "videos": (VIDEO_SUFFIXES, True),
     "audios": (AUDIO_SUFFIXES, True),
+    "recordings": (AUDIO_SUFFIXES | VIDEO_SUFFIXES, True),
 }
 
 
@@ -653,10 +669,11 @@ class Helper:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             args, out = render_args(body, self.projects, self.out_dir, time.strftime("%Y%m%d-%H%M%S"))
             return self.start_job("render", args, {"out": str(out), "project": body.get("project")})
-        if method == "POST" and parts in (["sync"], ["speakers"], ["match"]):
+        if method == "POST" and parts in (["sync"], ["speakers"], ["match"], ["clean"]):
             kind = parts[0]
-            build = {"sync": sync_args, "speakers": speakers_args, "match": match_args}[kind]
-            folder = {"sync": "Podcast sync", "speakers": "Speaker labels", "match": "Camera matching"}[kind]
+            build = {"sync": sync_args, "speakers": speakers_args, "match": match_args, "clean": clean_args}[kind]
+            folder = {"sync": "Podcast sync", "speakers": "Speaker labels", "match": "Camera matching",
+                      "clean": "Audio cleanup"}[kind]
             build(body, self.out_dir / folder)  # a bad request stops here, before any folder is made
             out = fresh_dir(self.out_dir / folder, time.strftime("%Y%m%d-%H%M%S"))
             args = build(body, out)
