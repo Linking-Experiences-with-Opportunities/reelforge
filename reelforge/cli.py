@@ -11,6 +11,7 @@ from pathlib import Path
 from . import analyze as analyze_mod
 from . import beats as beats_mod
 from . import captions as captions_mod
+from . import clean as clean_mod
 from . import ingest as ingest_mod
 from . import match as match_mod
 from . import recipe as recipe_mod
@@ -642,6 +643,38 @@ def cmd_speakers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    sources = clean_mod.collect(args.inputs)
+    if not sources:
+        raise ToolError("no audio or video files to clean")
+    loudness = None if args.no_normalize else args.loudness
+    _print(f"-> cleaning {len(sources)} file(s); the originals are not changed")
+    failed = 0
+    out_dirs: set[Path] = set()
+    taken: dict[Path, set[str]] = {}
+    for source in sources:
+        out_dir = Path(args.out_dir).expanduser() if args.out_dir else source.parent
+        try:
+            has_video = clean_mod.streams(source)[1]
+            name = clean_mod.output_name(source, has_video, args.suffix,
+                                         taken.setdefault(out_dir, set()))
+            result = clean_mod.clean_file(source, out_dir / name, strength=args.strength,
+                                          loudness=loudness, bitrate=args.bitrate)
+        except ToolError as exc:
+            failed += 1
+            _print(f"   FAILED    {source.name}: {str(exc).strip().splitlines()[-1].split(": ")[-1]}")
+            continue
+        out_dirs.add(out_dir)
+        _print(f"   {source.name}: {result.summary() or 'cleaned'}")
+    done = len(sources) - failed
+    if not done:
+        raise ToolError("nothing could be cleaned")
+    where = str(next(iter(out_dirs))) if len(out_dirs) == 1 else "the folders the files came from"
+    skipped = f" ({failed} could not be cleaned)" if failed else ""
+    _print(f"-> {done} cleaned file(s){skipped} in {where}")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     return serve_mod.serve(Path(args.projects).expanduser(), args.port, args.allow_origin)
 
@@ -904,6 +937,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_match.add_argument("--report", metavar="FILE", help="write measurements and filters as JSON")
     p_match.add_argument("--suffix", default="-matched", help="added to output file names")
     p_match.set_defaults(func=cmd_match)
+
+    p_clean = sub.add_parser(
+        "clean", help="reduce background noise and even out the volume of audio or video")
+    p_clean.add_argument("inputs", nargs="+", metavar="PATH",
+                         help="audio/video files and/or folders of them")
+    p_clean.add_argument("--out-dir", metavar="DIR",
+                         help="write the cleaned copies here (default: next to each source)")
+    p_clean.add_argument("--strength", default="normal", choices=list(clean_mod.STRENGTHS),
+                         help="how hard to push the noise down (default: normal)")
+    p_clean.add_argument("--loudness", type=float, default=clean_mod.DEFAULT_LOUDNESS,
+                         metavar="LUFS",
+                         help=f"volume to set (default: {clean_mod.DEFAULT_LOUDNESS:g})")
+    p_clean.add_argument("--no-normalize", action="store_true",
+                         help="leave the volume as it is")
+    p_clean.add_argument("--bitrate", default="192k", help="AAC bitrate (default: 192k)")
+    p_clean.add_argument("--suffix", default="-clean",
+                         help="added to output file names (default: -clean)")
+    p_clean.set_defaults(func=cmd_clean)
 
     p_doctor = sub.add_parser("doctor", help="check that required tools are installed")
     p_doctor.set_defaults(func=cmd_doctor)
